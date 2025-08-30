@@ -2,7 +2,6 @@ import os
 import sys
 import time
 import gzip
-import shutil
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -49,6 +48,7 @@ FRAGMENTS_TO_REMOVE = [
 def process_file(file_path: str) -> dict:
     """
     Runs in a separate process. Removes specific fragments and writes to a new .gz file.
+    Also logs exactly what was removed and from which line.
     """
     local = {
         "file_name": os.path.basename(file_path),
@@ -57,27 +57,38 @@ def process_file(file_path: str) -> dict:
         "changes_made": 0,
     }
     out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
-    
+    removed_log = os.path.join(OUTPUT_FOLDER, local["file_name"] + ".removed.log")
+
     # Clean any stale partial from a previous failed attempt
     try:
         if os.path.exists(out_path):
             os.remove(out_path)
+        if os.path.exists(removed_log):
+            os.remove(removed_log)
     except Exception:
         pass
 
     try:
         with gzip.open(file_path, "rt", encoding="utf-8", errors="ignore") as f_in, \
-             gzip.open(out_path, "wt", encoding="utf-8", compresslevel=GZIP_LEVEL) as f_out:
-            
-            for line in f_in:
+             gzip.open(out_path, "wt", encoding="utf-8", compresslevel=GZIP_LEVEL) as f_out, \
+             open(removed_log, "a", encoding="utf-8") as f_removed:
+
+            for line_num, line in enumerate(f_in, start=1):
                 local["lines_processed"] += 1
                 cleaned_line = line
+                removed_this_line = []
+
                 for fragment in FRAGMENTS_TO_REMOVE:
-                    cleaned_line = cleaned_line.replace(fragment, "")
-                
-                if cleaned_line != line:
+                    if fragment in cleaned_line:
+                        removed_this_line.append(fragment)
+                        cleaned_line = cleaned_line.replace(fragment, "")
+
+                if removed_this_line:
                     local["changes_made"] += 1
-                
+                    f_removed.write(
+                        f"Line {line_num}: removed {removed_this_line}\n"
+                    )
+
                 f_out.write(cleaned_line)
 
     except Exception as e:
@@ -85,6 +96,8 @@ def process_file(file_path: str) -> dict:
         try:
             if os.path.exists(out_path):
                 os.remove(out_path)
+            if os.path.exists(removed_log):
+                os.remove(removed_log)
         except Exception:
             pass
         err = f"{local['file_name']}: {e.__class__.__name__}: {e}"
