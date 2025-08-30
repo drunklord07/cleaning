@@ -35,6 +35,7 @@ def process_file(file_path: str) -> dict:
         "lines_kept": 0,
         "lines_removed": 0,
         "error": None,
+        "removed_line_sample": [] # New list to store a sample of removed lines
     }
     out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
 
@@ -45,7 +46,6 @@ def process_file(file_path: str) -> dict:
     except Exception:
         pass
 
-    print(f"DEBUG: Started processing file: {local['file_name']}")
     try:
         with gzip.open(file_path, "rt", encoding="utf-8", errors="ignore") as f_in, \
              gzip.open(out_path, "wt", encoding="utf-8", compresslevel=GZIP_LEVEL) as f_out:
@@ -70,13 +70,16 @@ def process_file(file_path: str) -> dict:
                         # Keep the line, extract the CustomerId
                         f_out.write(f"CustomerId:{customer_id};{path}\n")
                         local["lines_kept"] += 1
-                        print(f"DEBUG: Found and wrote CustomerId: {customer_id}")
                     else:
                         # No CustomerId found, remove the line
                         local["lines_removed"] += 1
+                        if len(local["removed_line_sample"]) < 50:
+                            local["removed_line_sample"].append(raw_line)
                 else:
                     # Line doesn't match the required format, remove it
                     local["lines_removed"] += 1
+                    if len(local["removed_line_sample"]) < 50:
+                        local["removed_line_sample"].append(raw_line)
 
     except Exception as e:
         # Remove partial output so the file is retried next run
@@ -89,7 +92,6 @@ def process_file(file_path: str) -> dict:
         err += "\n" + "".join(traceback.format_exception_only(type(e), e)).strip()
         local["error"] = err
     
-    print(f"DEBUG: Finished processing {local['file_name']}. Kept: {local['lines_kept']}, Removed: {local['lines_removed']}")
     return local
 
 def load_completed_set(log_path: str) -> set:
@@ -126,6 +128,12 @@ def write_summary(summary_data):
         f.write(f"Total lines scanned: {summary_data['total_lines_scanned']}\n")
         f.write(f"Lines kept:          {summary_data['total_lines_kept']}\n")
         f.write(f"Lines removed:       {summary_data['total_lines_removed']}\n\n")
+
+        if summary_data["removed_line_sample"]:
+            f.write("=== Sample of Removed Lines ===\n")
+            for line in summary_data["removed_line_sample"]:
+                f.write(f"- {line}\n")
+            f.write("\n")
 
         if summary_data["errors"]:
             f.write("=== Errors ===\n")
@@ -166,6 +174,7 @@ def main():
         "total_lines_scanned": 0,
         "total_lines_kept": 0,
         "total_lines_removed": 0,
+        "removed_line_sample": [],
         "errors": []
     }
 
@@ -185,6 +194,7 @@ def main():
                     summary["total_lines_scanned"] += local_result["lines_scanned"]
                     summary["total_lines_kept"] += local_result["lines_kept"]
                     summary["total_lines_removed"] += local_result["lines_removed"]
+                    summary["removed_line_sample"].extend(local_result["removed_line_sample"])
                     
                     if local_result["error"]:
                         summary["files_error"] += 1
