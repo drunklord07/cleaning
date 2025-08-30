@@ -2,22 +2,22 @@ import os
 import sys
 import time
 import gzip
+import shutil
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from tqdm import tqdm
-from threading import Lock
 
 # ====== CONFIGURATION ====== #
-INPUT_FOLDER = "input_logs"       # Folder with .gz inputs (non-recursive)
-OUTPUT_FOLDER = "cleaned_output"  # Cleaned outputs as .gz (same basenames)
-SUMMARY_FILE = "summary_report.txt"
-RESUME_LOG = "resume_files.log"
-DEBUG_LOG = "debug.log"
-MAX_WORKERS = 6
-GZIP_LEVEL = 6
+INPUT_FOLDER = "input_logs"      # Folder with .gz inputs (non-recursive)
+OUTPUT_FOLDER = "cleaned_output" # Cleaned outputs as .gz (same basenames)
+SUMMARY_FILE = "summary_report.txt"  # Saved in current working dir
+RESUME_LOG = "resume_files.log"  # Checkpoint log in current working dir
+MAX_WORKERS = 6                  # Use 6–8 for optimal performance
+GZIP_LEVEL = 6                   # Increased compression level
 # =========================== #
 
+# List of exact string fragments to be removed from each line
 FRAGMENTS_TO_REMOVE = [
     "channel-RETP, ",
     "useragent-null, ",
@@ -35,7 +35,7 @@ FRAGMENTS_TO_REMOVE = [
     "callerEntity-null, ",
     "mobileNumber=null, ",
     "ipAddress=null, ",
-    "@sApilevel=null, ",
+    "Apilevel=null, ",
     "appVersion-null, ",
     "Exnid-null, ",
     "fesessionId-null, ",
@@ -46,88 +46,42 @@ FRAGMENTS_TO_REMOVE = [
     "lastRequestShopPhoto=null"
 ]
 
-# Lock for thread-safe debug logging
-debug_lock = Lock()
-
-def sniff_text_encoding_gz(path: str) -> str:
-    """Quick BOM sniff for gzipped text. Falls back to utf-8."""
-    with gzip.open(path, "rb") as f:
-        head = f.read(4)
-    if head.startswith(b"\xff\xfe"):
-        return "utf-16-le"
-    if head.startswith(b"\xfe\xff"):
-        return "utf-16-be"
-    if head.startswith(b"\xef\xbb\xbf"):
-        return "utf-8-sig"
-    return "utf-8"
-
-def log_debug(file_name, encoding, samples_in, samples_out, lines_processed, lines_written):
-    """Thread-safe debug logger for each file."""
-    with debug_lock:
-        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
-            f.write(f"\n=== DEBUG for {file_name} ===\n")
-            f.write(f"Encoding: {encoding}\n")
-            f.write(f"Lines processed: {lines_processed}, Lines written: {lines_written}\n")
-            f.write("Sample input lines:\n")
-            for ln in samples_in:
-                f.write("  IN : " + repr(ln[:200]) + "\n")
-            f.write("Sample cleaned lines:\n")
-            for ln in samples_out:
-                f.write("  OUT: " + repr(ln[:200]) + "\n")
-            f.write("="*40 + "\n")
-
 def process_file(file_path: str) -> dict:
+    """
+    Runs in a separate process. Removes specific fragments and writes to a new .gz file.
+    """
     local = {
         "file_name": os.path.basename(file_path),
         "lines_processed": 0,
-        "lines_written": 0,
-        "encoding": None,
         "error": None,
+        "changes_made": 0,
     }
     out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
-
+    
+    # Clean any stale partial from a previous failed attempt
     try:
         if os.path.exists(out_path):
             os.remove(out_path)
     except Exception:
         pass
 
-    samples_in, samples_out = [], []
-
     try:
-        enc = sniff_text_encoding_gz(file_path)
-        local["encoding"] = enc
-
-        with gzip.open(file_path, "rt", encoding=enc, errors="replace") as f_in, \
+        with gzip.open(file_path, "rt", encoding="utf-8", errors="ignore") as f_in, \
              gzip.open(out_path, "wt", encoding="utf-8", compresslevel=GZIP_LEVEL) as f_out:
-
+            
             for line in f_in:
                 local["lines_processed"] += 1
-                if len(samples_in) < 5:
-                    samples_in.append(line)
-
-                cleaned = line
-                for frag in FRAGMENTS_TO_REMOVE:
-                    cleaned = cleaned.replace(frag, "")
-
-                if cleaned.strip():
-                    f_out.write(cleaned)
-                    local["lines_written"] += 1
-                    if len(samples_out) < 5:
-                        samples_out.append(cleaned)
-                else:
-                    f_out.write("\n")
-                    if len(samples_out) < 5:
-                        samples_out.append("\\n")
-
-        # Debug dump
-        log_debug(local["file_name"], enc, samples_in, samples_out,
-                  local["lines_processed"], local["lines_written"])
-
-        if local["lines_processed"] > 0 and local["lines_written"] == 0:
-            local["error"] = f"{local['file_name']} → 0 non-empty lines written"
+                cleaned_line = line
+                for fragment in FRAGMENTS_TO_REMOVE:
+                    cleaned_line = cleaned_line.replace(fragment, "")
+                
+                if cleaned_line != line:
+                    local["changes_made"] += 1
+                
+                f_out.write(cleaned_line)
 
     except Exception as e:
+        # Remove partial output so the file is retried next run
         try:
             if os.path.exists(out_path):
                 os.remove(out_path)
@@ -140,6 +94,7 @@ def process_file(file_path: str) -> dict:
     return local
 
 def load_completed_set(log_path: str) -> set:
+    """Loads a set of completed files from the resume log."""
     completed = set()
     if os.path.exists(log_path):
         with open(log_path, "r", encoding="utf-8") as f:
@@ -150,25 +105,27 @@ def load_completed_set(log_path: str) -> set:
     return completed
 
 def append_completed(log_path: str, file_name: str):
+    """Appends a completed file name to the resume log."""
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(file_name + "\n")
 
 def write_summary(summary_data):
+    """Writes the summary report to a file."""
     summary_data["end_ts"] = time.time()
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
         f.write(f"Log Cleaning Summary Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Input Folder:  {os.path.abspath(summary_data['input_folder'])}\n")
-        f.write(f"Output Folder: {os.path.abspath(summary_data['output_folder'])}\n")
-        f.write(f"Max Workers:   {summary_data['max_workers']}\n\n")
+        f.write(f"Input Folder: {os.path.abspath(INPUT_FOLDER)}\n")
+        f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n")
+        f.write(f"Max Workers: {summary_data['max_workers']}\n\n")
 
-        f.write("=== Files ===\n")
+        f.write("=== Files Processed ===\n")
         f.write(f"Processed: {summary_data['files_scanned']}\n")
         f.write(f"Success:   {summary_data['files_success']}\n")
         f.write(f"Errors:    {summary_data['files_error']}\n\n")
 
-        f.write("=== Lines ===\n")
+        f.write("=== Lines Processed ===\n")
         f.write(f"Total lines processed: {summary_data['total_lines_processed']}\n")
-        f.write(f"Total lines written:   {summary_data['total_lines_written']}\n\n")
+        f.write(f"Total changes made:    {summary_data['total_changes_made']}\n\n")
 
         if summary_data["errors"]:
             f.write("=== Errors ===\n")
@@ -200,8 +157,6 @@ def main():
         return
 
     summary = {
-        "input_folder": INPUT_FOLDER,
-        "output_folder": OUTPUT_FOLDER,
         "start_ts": time.time(),
         "end_ts": None,
         "max_workers": MAX_WORKERS,
@@ -209,7 +164,7 @@ def main():
         "files_success": 0,
         "files_error": 0,
         "total_lines_processed": 0,
-        "total_lines_written": 0,
+        "total_changes_made": 0,
         "errors": []
     }
 
@@ -218,23 +173,24 @@ def main():
     try:
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(process_file, fp): fp for fp in pending_files}
+            
             for fut in as_completed(futures):
                 file_path = futures[fut]
                 base_name = os.path.basename(file_path)
 
                 try:
-                    local = fut.result()
+                    local_result = fut.result()
                     summary["files_scanned"] += 1
-                    summary["total_lines_processed"] += local["lines_processed"]
-                    summary["total_lines_written"] += local["lines_written"]
-
-                    if local["error"]:
+                    summary["total_lines_processed"] += local_result["lines_processed"]
+                    summary["total_changes_made"] += local_result["changes_made"]
+                    
+                    if local_result["error"]:
                         summary["files_error"] += 1
-                        summary["errors"].append(local["error"])
+                        summary["errors"].append(local_result["error"])
                     else:
                         summary["files_success"] += 1
                         append_completed(RESUME_LOG, base_name)
-
+                    
                 except Exception as e:
                     summary["files_scanned"] += 1
                     summary["files_error"] += 1
@@ -242,12 +198,14 @@ def main():
 
                 overall_bar.update(1)
 
+                # Calculate and display ETA
                 if summary["files_scanned"] > 0:
-                    elapsed = time.time() - summary["start_ts"]
-                    avg_per = elapsed / summary["files_scanned"]
-                    remain = len(pending_files) - summary["files_scanned"]
-                    eta_seconds = int(remain * avg_per)
-                    overall_bar.set_postfix_str(f"ETA: {timedelta(seconds=eta_seconds)}")
+                    elapsed_time = time.time() - summary["start_ts"]
+                    avg_time_per_file = elapsed_time / summary["files_scanned"]
+                    remaining_files = len(pending_files) - summary["files_scanned"]
+                    eta_seconds = remaining_files * avg_time_per_file
+                    eta_delta = timedelta(seconds=int(eta_seconds))
+                    overall_bar.set_postfix_str(f"ETA: {str(eta_delta)}")
 
     finally:
         overall_bar.close()
