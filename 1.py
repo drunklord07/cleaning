@@ -18,8 +18,9 @@ GZIP_LEVEL = 6                   # Increased compression level
 # =========================== #
 
 # This regex identifies the specific log format and captures the CustomerId
+# It now requires the "‹### Request uri : " string to be present.
 LOG_PATTERN = re.compile(
-    r'^(?:\[[^]]+\]\s*){7}-.*?(?:\[CustomerId:([^]]*)\]).*?$',
+    r'^(?:\[[^]]+\]\s*){7}-\s*‹### Request uri\s*:\s*.*?(?:\[CustomerId:([^]]*)\]).*?$',
     re.DOTALL
 )
 
