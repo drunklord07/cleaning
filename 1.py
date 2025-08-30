@@ -45,6 +45,7 @@ def process_file(file_path: str) -> dict:
     except Exception:
         pass
 
+    print(f"DEBUG: Started processing file: {local['file_name']}")
     try:
         with gzip.open(file_path, "rt", encoding="utf-8", errors="ignore") as f_in, \
              gzip.open(out_path, "wt", encoding="utf-8", compresslevel=GZIP_LEVEL) as f_out:
@@ -69,6 +70,7 @@ def process_file(file_path: str) -> dict:
                         # Keep the line, extract the CustomerId
                         f_out.write(f"CustomerId:{customer_id};{path}\n")
                         local["lines_kept"] += 1
+                        print(f"DEBUG: Found and wrote CustomerId: {customer_id}")
                     else:
                         # No CustomerId found, remove the line
                         local["lines_removed"] += 1
@@ -87,6 +89,7 @@ def process_file(file_path: str) -> dict:
         err += "\n" + "".join(traceback.format_exception_only(type(e), e)).strip()
         local["error"] = err
     
+    print(f"DEBUG: Finished processing {local['file_name']}. Kept: {local['lines_kept']}, Removed: {local['lines_removed']}")
     return local
 
 def load_completed_set(log_path: str) -> set:
