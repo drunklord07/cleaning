@@ -42,8 +42,6 @@ FRAGMENTS_TO_REMOVE = [
     "jwtayload-null, ",
     "requestip-null, ",
     "prmnumber-null, ",
-    " [CustomerId: ]",
-    " [CustomerId:]",
     "vprRequestAppType=null, ",
     "lastRequestShopPhoto=null"
 ]
