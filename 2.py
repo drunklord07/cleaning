@@ -3,6 +3,7 @@ import re
 import sys
 import time
 import gzip
+import shutil
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -35,7 +36,7 @@ FRAGMENTS_TO_REMOVE = [
     "callerEntity-null, ",
     "mobileNumber=null, ",
     "ipAddress=null, ",
-    "@sApilevel=null, ",
+    "Apilevel=null, ",
     "appVersion-null, ",
     "Exnid-null, ",
     "fesessionId-null, ",
@@ -49,24 +50,31 @@ FRAGMENTS_TO_REMOVE = [
 def process_file(file_path: str) -> dict:
     """
     Runs in a separate process. Removes specific fragments and writes to a new .gz file.
+    If no fragments are found, the original file is copied.
     """
     local = {
         "file_name": os.path.basename(file_path),
         "lines_processed": 0,
         "error": None,
+        "changes_made": 0,
     }
     out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
 
+    # Use a temporary path to avoid corrupting the output file on failure
+    temp_out_path = out_path + ".tmp"
+    
     # Clean any stale partial from a previous failed attempt
     try:
         if os.path.exists(out_path):
             os.remove(out_path)
+        if os.path.exists(temp_out_path):
+            os.remove(temp_out_path)
     except Exception:
         pass
 
     try:
         with gzip.open(file_path, "rt", encoding="utf-8", errors="ignore") as f_in, \
-             gzip.open(out_path, "wt", encoding="utf-8", compresslevel=GZIP_LEVEL) as f_out:
+             gzip.open(temp_out_path, "wt", encoding="utf-8", compresslevel=GZIP_LEVEL) as f_out:
 
             for line in f_in:
                 local["lines_processed"] += 1
@@ -74,13 +82,25 @@ def process_file(file_path: str) -> dict:
                 for fragment in FRAGMENTS_TO_REMOVE:
                     cleaned_line = cleaned_line.replace(fragment, "")
                 
+                if cleaned_line != line:
+                    local["changes_made"] += 1
+                
                 f_out.write(cleaned_line)
+        
+        # After processing the entire file, decide what to do
+        if local["changes_made"] > 0:
+            shutil.move(temp_out_path, out_path)
+        else:
+            os.remove(temp_out_path)
+            shutil.copyfile(file_path, out_path)
 
     except Exception as e:
         # Remove partial output so the file is retried next run
         try:
             if os.path.exists(out_path):
                 os.remove(out_path)
+            if os.path.exists(temp_out_path):
+                os.remove(temp_out_path)
         except Exception:
             pass
         err = f"{local['file_name']}: {e.__class__.__name__}: {e}"
@@ -120,7 +140,8 @@ def write_summary(summary_data):
         f.write(f"Errors:    {summary_data['files_error']}\n\n")
 
         f.write("=== Lines Processed ===\n")
-        f.write(f"Total lines processed: {summary_data['total_lines_processed']}\n\n")
+        f.write(f"Total lines processed: {summary_data['total_lines_processed']}\n")
+        f.write(f"Total changes made:    {summary_data['total_changes_made']}\n\n")
 
         if summary_data["errors"]:
             f.write("=== Errors ===\n")
@@ -159,6 +180,7 @@ def main():
         "files_success": 0,
         "files_error": 0,
         "total_lines_processed": 0,
+        "total_changes_made": 0,
         "errors": []
     }
 
@@ -176,6 +198,7 @@ def main():
                     local_result = fut.result()
                     summary["files_scanned"] += 1
                     summary["total_lines_processed"] += local_result["lines_processed"]
+                    summary["total_changes_made"] += local_result["changes_made"]
                     
                     if local_result["error"]:
                         summary["files_error"] += 1
