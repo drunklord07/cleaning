@@ -15,7 +15,7 @@ MAX_WORKERS = 6                     # Use 6–8 for optimal performance
 ALLOWED_EXTS = (".txt", ".log")     # File extensions to process
 # =========================== #
 
-# List of exact string fragments to be removed from each line
+# Exact string fragments to be removed from each line
 FRAGMENTS_TO_REMOVE = [
     "channel-RETP, ",
     "useragent-null, ",
@@ -47,56 +47,46 @@ FRAGMENTS_TO_REMOVE = [
 def process_file(file_path: str) -> dict:
     """
     Runs in a separate process. Removes specific fragments and writes to a new .txt file.
-    Also logs exactly what was removed and from which line.
     """
     local = {
         "file_name": os.path.basename(file_path),
         "lines_processed": 0,
         "error": None,
-        "changes_made": 0,
+        "changes_made": 0,  # counts lines where any fragment was removed
     }
-
-    # Output uses same basename (keeps .txt/.log)
     out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
-    removed_log = os.path.join(OUTPUT_FOLDER, local["file_name"] + ".removed.log")
 
     # Clean any stale partial from a previous failed attempt
     try:
         if os.path.exists(out_path):
             os.remove(out_path)
-        if os.path.exists(removed_log):
-            os.remove(removed_log)
     except Exception:
         pass
 
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f_in, \
-             open(out_path, "w", encoding="utf-8") as f_out, \
-             open(removed_log, "a", encoding="utf-8") as f_removed:
+             open(out_path, "w", encoding="utf-8") as f_out:
 
-            for line_num, line in enumerate(f_in, start=1):
+            for line in f_in:
                 local["lines_processed"] += 1
-                cleaned_line = line
-                removed_this_line = []
+                cleaned = line
+                changed = False
 
                 for fragment in FRAGMENTS_TO_REMOVE:
-                    if fragment in cleaned_line:
-                        removed_this_line.append(fragment)
-                        cleaned_line = cleaned_line.replace(fragment, "")
+                    if fragment in cleaned:
+                        cleaned = cleaned.replace(fragment, "")
+                        changed = True
 
-                if removed_this_line:
+                if changed:
                     local["changes_made"] += 1
-                    f_removed.write(f"Line {line_num}: removed {removed_this_line}\n")
 
-                f_out.write(cleaned_line)
+                f_out.write(cleaned)
 
     except Exception as e:
         # Remove partial output so the file is retried next run
         try:
             if os.path.exists(out_path):
                 os.remove(out_path)
-            if os.path.exists(removed_log):
-                os.remove(removed_log)
         except Exception:
             pass
         err = f"{local['file_name']}: {e.__class__.__name__}: {e}"
@@ -137,7 +127,7 @@ def write_summary(summary_data):
 
         f.write("=== Lines Processed ===\n")
         f.write(f"Total lines processed: {summary_data['total_lines_processed']}\n")
-        f.write(f"Total changes made:    {summary_data['total_changes_made']}\n\n")
+        f.write(f"Total lines changed:   {summary_data['total_changes_made']}\n\n")
 
         if summary_data["errors"]:
             f.write("=== Errors ===\n")
