@@ -1,19 +1,18 @@
 import os
 import sys
 import time
-import gzip
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from tqdm import tqdm
 
 # ====== CONFIGURATION ====== #
-INPUT_FOLDER = "input_logs"      # Folder with .gz inputs (non-recursive)
-OUTPUT_FOLDER = "cleaned_output" # Cleaned outputs as .gz (same basenames)
-SUMMARY_FILE = "summary_report.txt"  # Saved in current working dir
-RESUME_LOG = "resume_files.log"  # Checkpoint log in current working dir
-MAX_WORKERS = 6                  # Use 6–8 for optimal performance
-GZIP_LEVEL = 6                   # Increased compression level
+INPUT_FOLDER = "input_logs"         # Folder with .txt/.log inputs (non-recursive)
+OUTPUT_FOLDER = "cleaned_output"    # Cleaned outputs as .txt (same basenames)
+SUMMARY_FILE = "summary_report.txt" # Saved in current working dir
+RESUME_LOG = "resume_files.log"     # Checkpoint log in current working dir
+MAX_WORKERS = 6                     # Use 6–8 for optimal performance
+ALLOWED_EXTS = (".txt", ".log")     # File extensions to process
 # =========================== #
 
 # List of exact string fragments to be removed from each line
@@ -47,7 +46,7 @@ FRAGMENTS_TO_REMOVE = [
 
 def process_file(file_path: str) -> dict:
     """
-    Runs in a separate process. Removes specific fragments and writes to a new .gz file.
+    Runs in a separate process. Removes specific fragments and writes to a new .txt file.
     Also logs exactly what was removed and from which line.
     """
     local = {
@@ -56,6 +55,8 @@ def process_file(file_path: str) -> dict:
         "error": None,
         "changes_made": 0,
     }
+
+    # Output uses same basename (keeps .txt/.log)
     out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
     removed_log = os.path.join(OUTPUT_FOLDER, local["file_name"] + ".removed.log")
 
@@ -69,8 +70,8 @@ def process_file(file_path: str) -> dict:
         pass
 
     try:
-        with gzip.open(file_path, "rt", encoding="utf-8", errors="ignore") as f_in, \
-             gzip.open(out_path, "wt", encoding="utf-8", compresslevel=GZIP_LEVEL) as f_out, \
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f_in, \
+             open(out_path, "w", encoding="utf-8") as f_out, \
              open(removed_log, "a", encoding="utf-8") as f_removed:
 
             for line_num, line in enumerate(f_in, start=1):
@@ -85,9 +86,7 @@ def process_file(file_path: str) -> dict:
 
                 if removed_this_line:
                     local["changes_made"] += 1
-                    f_removed.write(
-                        f"Line {line_num}: removed {removed_this_line}\n"
-                    )
+                    f_removed.write(f"Line {line_num}: removed {removed_this_line}\n")
 
                 f_out.write(cleaned_line)
 
@@ -103,7 +102,7 @@ def process_file(file_path: str) -> dict:
         err = f"{local['file_name']}: {e.__class__.__name__}: {e}"
         err += "\n" + "".join(traceback.format_exception_only(type(e), e)).strip()
         local["error"] = err
-    
+
     return local
 
 def load_completed_set(log_path: str) -> set:
@@ -155,11 +154,12 @@ def main():
     all_files = sorted(
         os.path.join(INPUT_FOLDER, f)
         for f in os.listdir(INPUT_FOLDER)
-        if f.endswith(".gz") and os.path.isfile(os.path.join(INPUT_FOLDER, f))
+        if os.path.isfile(os.path.join(INPUT_FOLDER, f))
+        and os.path.splitext(f)[1].lower() in ALLOWED_EXTS
     )
 
     if not all_files:
-        print("No .gz files found in INPUT_FOLDER.", file=sys.stderr)
+        print(f"No {ALLOWED_EXTS} files found in INPUT_FOLDER.", file=sys.stderr)
         return
 
     completed = load_completed_set(RESUME_LOG)
@@ -186,7 +186,7 @@ def main():
     try:
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(process_file, fp): fp for fp in pending_files}
-            
+
             for fut in as_completed(futures):
                 file_path = futures[fut]
                 base_name = os.path.basename(file_path)
@@ -196,14 +196,14 @@ def main():
                     summary["files_scanned"] += 1
                     summary["total_lines_processed"] += local_result["lines_processed"]
                     summary["total_changes_made"] += local_result["changes_made"]
-                    
+
                     if local_result["error"]:
                         summary["files_error"] += 1
                         summary["errors"].append(local_result["error"])
                     else:
                         summary["files_success"] += 1
                         append_completed(RESUME_LOG, base_name)
-                    
+
                 except Exception as e:
                     summary["files_scanned"] += 1
                     summary["files_error"] += 1
@@ -216,7 +216,7 @@ def main():
                     elapsed_time = time.time() - summary["start_ts"]
                     avg_time_per_file = elapsed_time / summary["files_scanned"]
                     remaining_files = len(pending_files) - summary["files_scanned"]
-                    eta_seconds = remaining_files * avg_time_per_file
+                    eta_seconds = max(0, remaining_files * avg_time_per_file)
                     eta_delta = timedelta(seconds=int(eta_seconds))
                     overall_bar.set_postfix_str(f"ETA: {str(eta_delta)}")
 
