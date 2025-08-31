@@ -2,23 +2,24 @@ import os
 import re
 import sys
 import time
-import gzip
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from tqdm import tqdm
 
 # ====== CONFIGURATION ====== #
-INPUT_FOLDER = "input_logs"      # Folder with .gz inputs (non-recursive)
-OUTPUT_FOLDER = "filtered_output" # Filtered outputs as .gz (same basenames)
+INPUT_FOLDER = "input_logs"          # Folder with .txt inputs (non-recursive)
+OUTPUT_FOLDER = "filtered_output"    # Filtered outputs as .txt (same basenames)
 SUMMARY_FILE = "summary_report.txt"  # Saved in current working dir
-RESUME_LOG = "resume_files.log"  # Checkpoint log in current working dir
-MAX_WORKERS = 6                  # Use 6–8 for optimal performance
-GZIP_LEVEL = 6                   # Increased compression level
+RESUME_LOG = "resume_files.log"      # Checkpoint log in current working dir
+MAX_WORKERS = 6                      # Use 6–8 for optimal performance
+
+INPUT_EXTENSION = ".txt"             # Input file extension to process
+OUTPUT_EXTENSION = ".txt"            # Output file extension to write
 # =========================== #
 
 # This regex identifies the specific log format and captures the CustomerId
-# It now requires the "‹### Request uri : " string to be present.
+# It still requires the literal "‹### Request uri : " substring to be present.
 LOG_PATTERN = re.compile(
     r'^(?:\[[^]]+\]\s*){7}-\s*‹### Request uri\s*:\s*.*?(?:\[CustomerId:([^]]*)\]).*?$',
     re.DOTALL
@@ -26,7 +27,7 @@ LOG_PATTERN = re.compile(
 
 def process_file(file_path: str) -> dict:
     """
-    Runs in a separate process. Filters lines and writes to a new .gz file.
+    Runs in a separate process. Filters lines and writes to a new .txt file.
     Output format: CustomerId:value;path or nothing if line is dropped.
     """
     local = {
@@ -35,9 +36,17 @@ def process_file(file_path: str) -> dict:
         "lines_kept": 0,
         "lines_removed": 0,
         "error": None,
-        "removed_line_sample": [] # New list to store a sample of removed lines
+        "removed_line_sample": []  # Sample of removed lines (up to 50 per file)
     }
-    out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
+
+    in_base = os.path.basename(file_path)
+    # Build output basename by replacing the input extension with OUTPUT_EXTENSION
+    if in_base.endswith(INPUT_EXTENSION):
+        base_stub = in_base[: -len(INPUT_EXTENSION)]
+    else:
+        base_stub = os.path.splitext(in_base)[0]
+    out_base = base_stub + OUTPUT_EXTENSION
+    out_path = os.path.join(OUTPUT_FOLDER, out_base)
 
     # Clean any stale partial from a previous failed attempt
     try:
@@ -47,21 +56,21 @@ def process_file(file_path: str) -> dict:
         pass
 
     try:
-        with gzip.open(file_path, "rt", encoding="utf-8", errors="ignore") as f_in, \
-             gzip.open(out_path, "wt", encoding="utf-8", compresslevel=GZIP_LEVEL) as f_out:
+        with open(file_path, "rt", encoding="utf-8", errors="replace") as f_in, \
+             open(out_path, "wt", encoding="utf-8") as f_out:
 
             for line in f_in:
                 local["lines_scanned"] += 1
                 raw_line = line.rstrip("\n")
 
-                # Split the log line and the path
+                # Split the log line and the path (use the last ';' as the delimiter)
                 if ";" in raw_line:
                     log_content, path = raw_line.rsplit(";", 1)
                     log_content = log_content.rstrip()
                     path = path.strip()
                 else:
                     log_content, path = raw_line, "UNKNOWN_PATH"
-                
+
                 match = LOG_PATTERN.search(log_content)
 
                 if match:
@@ -91,7 +100,7 @@ def process_file(file_path: str) -> dict:
         err = f"{local['file_name']}: {e.__class__.__name__}: {e}"
         err += "\n" + "".join(traceback.format_exception_only(type(e), e)).strip()
         local["error"] = err
-    
+
     return local
 
 def load_completed_set(log_path: str) -> set:
@@ -150,11 +159,11 @@ def main():
     all_files = sorted(
         os.path.join(INPUT_FOLDER, f)
         for f in os.listdir(INPUT_FOLDER)
-        if f.endswith(".gz") and os.path.isfile(os.path.join(INPUT_FOLDER, f))
+        if f.endswith(INPUT_EXTENSION) and os.path.isfile(os.path.join(INPUT_FOLDER, f))
     )
 
     if not all_files:
-        print("No .gz files found in INPUT_FOLDER.", file=sys.stderr)
+        print(f"No {INPUT_EXTENSION} files found in INPUT_FOLDER.", file=sys.stderr)
         return
 
     completed = load_completed_set(RESUME_LOG)
@@ -183,7 +192,7 @@ def main():
     try:
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(process_file, fp): fp for fp in pending_files}
-            
+
             for fut in as_completed(futures):
                 file_path = futures[fut]
                 base_name = os.path.basename(file_path)
@@ -195,14 +204,14 @@ def main():
                     summary["total_lines_kept"] += local_result["lines_kept"]
                     summary["total_lines_removed"] += local_result["lines_removed"]
                     summary["removed_line_sample"].extend(local_result["removed_line_sample"])
-                    
+
                     if local_result["error"]:
                         summary["files_error"] += 1
                         summary["errors"].append(local_result["error"])
                     else:
                         summary["files_success"] += 1
                         append_completed(RESUME_LOG, base_name)
-                    
+
                 except Exception as e:
                     summary["files_scanned"] += 1
                     summary["files_error"] += 1
