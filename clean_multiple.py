@@ -55,49 +55,12 @@ def _line_hits_any_marker(line: str) -> (bool, list):
                 hits.append(i)
     return (len(hits) > 0, hits)
 
-def _find_semicolon_before_path(s: str) -> int:
+def _salvage_from_first_semicolon(line_wo_nl: str, keep_bracket: str) -> str:
     """
-    Find the index of the first ';' that is followed (after optional spaces/tabs)
-    by something that looks like a path:
-      - Windows drive:    C:\...  or  C:/...
-      - UNC:              \\server\share\...
-      - Unix absolute:    /...
-      - Relative:         ./..., ../...
-      - Home:             ~/..., ~\...
-    Return -1 if none.
+    Build salvaged line: [CustomerId: ...] + ' ' + substring from the first ';' (inclusive) to end.
+    If no ';' present, return just the bracket.
     """
-    i = -1
-    start = 0
-    L = len(s)
-    while True:
-        i = s.find(";", start)
-        if i == -1:
-            return -1
-        j = i + 1
-        # skip spaces/tabs
-        while j < L and s[j] in " \t":
-            j += 1
-        # Check path starts
-        if j + 2 < L and s[j].isalpha() and s[j+1] == ":" and (s[j+2] == "\\" or s[j+2] == "/"):
-            return i  # Windows drive
-        if j + 1 < L and s[j] == "\\" and s[j+1] == "\\":  # UNC
-            return i
-        if j < L and s[j] == "/":                          # Unix abs
-            return i
-        if j + 1 < L and s[j] == "~" and (s[j+1] in "/\\"):  # ~/
-            return i
-        if j + 1 < L and s[j] == "." and (s.startswith("./", j) or s.startswith(".\\", j)):
-            return i
-        if j + 2 < L and s[j] == "." and s[j+1] == "." and (s[j+2] in "/\\"):  # ../ or ..\
-            return i
-        start = i + 1
-
-def _salvage_with_customer(line_wo_nl: str, keep_bracket: str) -> str:
-    """
-    Build salvaged line: [CustomerId: ...] + space + substring from the semicolon-before-path.
-    If no such semicolon found, return just the bracket.
-    """
-    semi_idx = _find_semicolon_before_path(line_wo_nl)
+    semi_idx = line_wo_nl.find(";")
     if semi_idx == -1:
         return keep_bracket
     tail = line_wo_nl[semi_idx:]  # keep from ';' through end
@@ -109,9 +72,9 @@ def _salvage_with_customer(line_wo_nl: str, keep_bracket: str) -> str:
 def process_file(file_path: str) -> dict:
     """
     Removes any line that matches ANY marker, with CustomerId salvage rules:
-      - [CustomerId:] or [CustomerId: ]  -> drop line
-      - [CustomerId: non-empty]          -> keep only that bracket + ' ' + ';<file-path>...' tail
-      - no CustomerId bracket            -> drop line
+      - If [CustomerId:] or [CustomerId: ]  -> drop the line
+      - If [CustomerId: non-empty]         -> keep only that bracket + ' ' + substring from the first ';' to end
+      - If no [CustomerId: ...]            -> drop the line
     Lines with no marker are kept unchanged.
     """
     local = {
@@ -170,7 +133,7 @@ def process_file(file_path: str) -> dict:
 
                 if nonempty is not None:
                     keep_token = nonempty.group(0)  # preserve exact bracket text
-                    salvaged = _salvage_with_customer(base, keep_token)
+                    salvaged = _salvage_from_first_semicolon(base, keep_token)
                     f_out.write(salvaged + ("\n" if has_nl else ""))
                     local["lines_salvaged"] += 1
                 else:
@@ -210,7 +173,7 @@ def write_summary(summary_data):
     """Writes the summary report to a file."""
     summary_data["end_ts"] = time.time()
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-        f.write(f"Line Filter + CustomerId Salvage - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Line Filter + CustomerId Salvage (;tail) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Input Folder: {os.path.abspath(INPUT_FOLDER)}\n")
         f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n")
         f.write(f"Max Workers: {summary_data['max_workers']}\n")
@@ -301,7 +264,6 @@ def main():
                         for i, c in enumerate(res["per_marker_hits"]):
                             summary["per_marker_hits"][i] += c
                     else:
-                        # defensive handling if config changed
                         for i in range(min(len(res["per_marker_hits"]), len(summary["per_marker_hits"]))):
                             summary["per_marker_hits"][i] += res["per_marker_hits"][i]
 
