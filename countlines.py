@@ -18,7 +18,7 @@ def count_lines_in_file(path: Path) -> Tuple[str, int]:
         with path.open("r", encoding="utf-8", errors="ignore") as f:
             for _ in f:
                 count += 1
-    except Exception as e:
+    except Exception:
         # Return -1 to indicate an error; caller can handle/report it.
         return (str(path), -1)
     return (str(path), count)
@@ -63,12 +63,6 @@ def main():
     # Sort results by filename for stable output
     results.sort(key=lambda x: x[0])
 
-    # Print a quick summary to stdout
-    total_lines = sum(c for _, c in results if c >= 0)
-    print(f"Done. Total lines across readable files: {total_lines}")
-    if errors:
-        print(f"Note: {errors} file(s) could not be read (marked with -1).")
-
     # Write CSV if requested; otherwise, print tabular to stdout
     if args.out:
         with args.out.open("w", newline="", encoding="utf-8") as f:
@@ -81,6 +75,16 @@ def main():
         print("\nfilename,lines")
         for fname, line_count in results:
             print(f"{fname},{line_count}")
+        print()  # spacing before summary
+
+    # ---- FINAL SUMMARY (printed at the very end) ----
+    total_lines = sum(c for _, c in results if c >= 0)
+    readable_files = sum(1 for _, c in results if c >= 0)
+    print("Summary:")
+    print(f"  Files found      : {len(files)}")
+    print(f"  Readable files   : {readable_files}")
+    print(f"  Unreadable files : {errors}")
+    print(f"  Total lines (readable): {total_lines}")
 
 if __name__ == "__main__":
     main()
