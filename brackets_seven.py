@@ -14,36 +14,47 @@ SUMMARY_FILE = "summary_report.txt" # Saved in current working dir
 RESUME_LOG = "resume_files.log"     # Checkpoint log in current working dir
 MAX_WORKERS = 6                     # Parallelism
 ALLOWED_EXTS = (".txt",)            # Process only .txt files
+
 CASE_SENSITIVE = True               # 'CustomerId' must match case exactly
 EMIT_SINGLE_SPACE = True            # Normalize join spacing around kept items
 # =========================== #
 
-# Pattern for a space-separated preamble:
-# [T1] [T2] [T3] [T4] [T5] [T6] [T7] - [T8] <body>
-# We'll allow 1+ spaces in input but output clean single spaces if EMIT_SINGLE_SPACE.
-PREAMBLE_RE = re.compile(
-    r'^\s*'                                   # optional leading spaces
-    r'(\[[^\]]*\])\s+'                        # T1
-    r'(\[[^\]]*\])\s+'                        # T2
-    r'(\[[^\]]*\])\s+'                        # T3
-    r'(\[[^\]]*\])\s+'                        # T4
-    r'(\[[^\]]*\])\s+'                        # T5
-    r'(\[[^\]]*\])\s+'                        # T6
-    r'(\[[^\]]*\])\s+'                        # T7
-    r'-\s+'                                   # hyphen
-    r'(\[[^\]]*\])'                           # T8
-    r'(.*)$'                                  # body (can be empty), includes any trailing spaces
+# Preamble patterns (allow 1+ spaces between tokens; tolerate leading spaces).
+# 1) [T1] [T2] [T3] [T4] [T5] [T6] [T7] - [T8] <body>
+PREAMBLE8_RE = re.compile(
+    r'^\s*'
+    r'(\[[^\]]*\])\s+'  # T1
+    r'(\[[^\]]*\])\s+'  # T2
+    r'(\[[^\]]*\])\s+'  # T3
+    r'(\[[^\]]*\])\s+'  # T4
+    r'(\[[^\]]*\])\s+'  # T5
+    r'(\[[^\]]*\])\s+'  # T6
+    r'(\[[^\]]*\])\s+'  # T7
+    r'-\s+'             # hyphen
+    r'(\[[^\]]*\])'     # T8
+    r'(.*)$'            # body
+)
+
+# 2) [T1] [T2] [T3] [T4] [T5] [T6] [T7] - <body>
+PREAMBLE7_RE = re.compile(
+    r'^\s*'
+    r'(\[[^\]]*\])\s+'  # T1
+    r'(\[[^\]]*\])\s+'  # T2
+    r'(\[[^\]]*\])\s+'  # T3
+    r'(\[[^\]]*\])\s+'  # T4
+    r'(\[[^\]]*\])\s+'  # T5
+    r'(\[[^\]]*\])\s+'  # T6
+    r'(\[[^\]]*\])\s+'  # T7
+    r'-\s+'             # hyphen
+    r'(.*)$'            # body
 )
 
 CUSTOMER_KEY = "CustomerId:"
 
 def classify_customer_bracket(token: str, case_sensitive: bool) -> str:
     """
-    token: e.g. "[CustomerId: 123]" or "[Foo]".
-    Returns:
-      - "none"      : not a CustomerId token
-      - "empty"     : [CustomerId:] or [CustomerId: ] (only whitespace after colon)
-      - "nonempty"  : [CustomerId: <non-empty>]
+    token: "[CustomerId: ...]" or other "[...]"
+    Returns: "none" | "empty" | "nonempty"
     """
     if not (token.startswith("[") and token.endswith("]")):
         return "none"
@@ -51,73 +62,97 @@ def classify_customer_bracket(token: str, case_sensitive: bool) -> str:
     inner = token[1:-1]
     key = CUSTOMER_KEY if case_sensitive else CUSTOMER_KEY.lower()
     target = inner if case_sensitive else inner.lower()
-
     if not target.startswith(key):
         return "none"
 
-    # Suffix after "CustomerId:"
     suffix = inner[len(CUSTOMER_KEY):] if case_sensitive else inner[len(key):]
-    # If suffix is only whitespace (including empty), treat as empty
     return "empty" if suffix.strip() == "" else "nonempty"
 
-def transform_line(line: str) -> str:
-    """Apply the preamble rules to a single line; preserve newline."""
-    has_nl = line.endswith("\n")
-    base = line[:-1] if has_nl else line
-
-    m = PREAMBLE_RE.match(base)
-    if not m:
-        return line  # leave unchanged
-
-    tokens = list(m.groups()[:8])  # T1..T8
-    body = m.group(9)              # body (may be empty; may start with spaces)
-
-    # Find first CustomerId token and classify
+def transform_preamble(tokens, body):
+    """
+    Apply CustomerId rules over the given preamble tokens (list of strings) and body.
+    Returns (new_text, changed: bool, removed: bool, reduced: bool).
+    - removed=True when whole preamble is dropped (empty CustomerId).
+    - reduced=True when only [CustomerId: non-empty] is kept from preamble.
+    """
     cust_index = -1
     cust_class = "none"
     for i, tok in enumerate(tokens):
         c = classify_customer_bracket(tok, CASE_SENSITIVE)
         if c != "none":
-            cust_index = i
-            cust_class = c
+            cust_index, cust_class = i, c
             break
 
-    # No CustomerId in preamble => unchanged
     if cust_index == -1:
-        return line
+        # no CustomerId in preamble -> unchanged
+        return body if False else None, False, False, False
 
-    # Build output according to rules
     if cust_class == "empty":
-        # Remove entire preamble; keep only the body
+        # Drop entire preamble; keep only body
         out_body = body.lstrip() if EMIT_SINGLE_SPACE else body
-        out = out_body
+        return out_body, True, True, False
     else:
-        # nonempty: keep only the CustomerId token + body
+        # Keep only that CustomerId token + body
         keep_token = tokens[cust_index]
         if EMIT_SINGLE_SPACE:
             out_body = body.lstrip()
-            out = keep_token + ((" " + out_body) if out_body else "")
+            new_text = keep_token + ((" " + out_body) if out_body else "")
         else:
-            out = keep_token + body  # preserve original spacing
+            new_text = keep_token + body
+        return new_text, True, False, True
 
-    return (out + ("\n" if has_nl else ""))
+def transform_line(line: str) -> (str, dict):
+    """
+    Try 8-token preamble first; if not matched, try 7-token.
+    Returns the (possibly) transformed line and a stats dict describing the change.
+    """
+    stats = {"matched8": False, "matched7": False, "removed": False, "reduced": False, "changed": False}
+
+    has_nl = line.endswith("\n")
+    base = line[:-1] if has_nl else line
+
+    m8 = PREAMBLE8_RE.match(base)
+    if m8:
+        stats["matched8"] = True
+        tokens = list(m8.groups()[:8])
+        body = m8.group(9)
+        new_text, changed, removed, reduced = transform_preamble(tokens, body)
+        if changed:
+            stats.update({"changed": True, "removed": removed, "reduced": reduced})
+            return (new_text + ("\n" if has_nl else "")), stats
+        else:
+            # unchanged
+            return line, stats
+
+    m7 = PREAMBLE7_RE.match(base)
+    if m7:
+        stats["matched7"] = True
+        tokens = list(m7.groups()[:7])
+        body = m7.group(8)
+        new_text, changed, removed, reduced = transform_preamble(tokens, body)
+        if changed:
+            stats.update({"changed": True, "removed": removed, "reduced": reduced})
+            return (new_text + ("\n" if has_nl else "")), stats
+        else:
+            return line, stats
+
+    # No preamble matched
+    return line, stats
 
 def process_file(file_path: str) -> dict:
-    """
-    Processes a file line by line applying the transform_line() rules.
-    """
     local = {
         "file_name": os.path.basename(file_path),
         "lines_processed": 0,
         "lines_modified": 0,
         "preambles_removed": 0,
         "preambles_reduced": 0,
+        "matched8": 0,
+        "matched7": 0,
         "error": None,
     }
 
     out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
 
-    # Clean any stale partial from a previous failed attempt
     try:
         if os.path.exists(out_path):
             os.remove(out_path)
@@ -130,33 +165,22 @@ def process_file(file_path: str) -> dict:
 
             for raw in f_in:
                 local["lines_processed"] += 1
-                new = transform_line(raw)
-                if new != raw:
+                new_line, st = transform_line(raw)
+
+                if st["matched8"]:
+                    local["matched8"] += 1
+                if st["matched7"]:
+                    local["matched7"] += 1
+                if st["changed"]:
                     local["lines_modified"] += 1
-                    # classify what happened for counts
-                    # Use same logic again but cheaper: we can detect by regex
-                    m = PREAMBLE_RE.match(raw.rstrip("\n"))
-                    if m:
-                        tokens = list(m.groups()[:8])
-                        # did we remove entire preamble (empty CustomerId) or reduce (non-empty)?
-                        changed = False
-                        for tok in tokens:
-                            cls = classify_customer_bracket(tok, CASE_SENSITIVE)
-                            if cls == "empty":
-                                local["preambles_removed"] += 1
-                                changed = True
-                                break
-                            elif cls == "nonempty":
-                                local["preambles_reduced"] += 1
-                                changed = True
-                                break
-                        if not changed:
-                            # shouldn't happen, but just in case
-                            local["preambles_reduced"] += 1
-                f_out.write(new)
+                    if st["removed"]:
+                        local["preambles_removed"] += 1
+                    elif st["reduced"]:
+                        local["preambles_reduced"] += 1
+
+                f_out.write(new_line)
 
     except Exception as e:
-        # Remove partial output so the file is retried next run
         try:
             if os.path.exists(out_path):
                 os.remove(out_path)
@@ -185,7 +209,7 @@ def append_completed(log_path: str, file_name: str):
 def write_summary(summary):
     summary["end_ts"] = time.time()
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-        f.write(f"Preamble CustomerId Normalizer - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Preamble CustomerId Normalizer (7-or-8) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Input Folder: {os.path.abspath(INPUT_FOLDER)}\n")
         f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n")
         f.write(f"Max Workers: {summary['max_workers']}\n")
@@ -198,10 +222,12 @@ def write_summary(summary):
         f.write(f"Errors:    {summary['files_error']}\n\n")
 
         f.write("=== Lines ===\n")
-        f.write(f"Total processed:      {summary['total_lines_processed']}\n")
-        f.write(f"Total modified:       {summary['total_lines_modified']}\n")
-        f.write(f"Preambles removed:    {summary['preambles_removed']}\n")
-        f.write(f"Preambles reduced:    {summary['preambles_reduced']}\n\n")
+        f.write(f"Total processed:       {summary['total_lines_processed']}\n")
+        f.write(f"Total modified:        {summary['total_lines_modified']}\n")
+        f.write(f"Preambles removed:     {summary['preambles_removed']}\n")
+        f.write(f"Preambles reduced:     {summary['preambles_reduced']}\n")
+        f.write(f"Matched 8-token lines: {summary['matched8']}\n")
+        f.write(f"Matched 7-token lines: {summary['matched7']}\n\n")
 
         if summary["errors"]:
             f.write("=== Errors ===\n")
@@ -244,6 +270,8 @@ def main():
         "total_lines_modified": 0,
         "preambles_removed": 0,
         "preambles_reduced": 0,
+        "matched8": 0,
+        "matched7": 0,
         "errors": []
     }
 
@@ -264,6 +292,8 @@ def main():
                     summary["total_lines_modified"] += res["lines_modified"]
                     summary["preambles_removed"] += res["preambles_removed"]
                     summary["preambles_reduced"] += res["preambles_reduced"]
+                    summary["matched8"] += res["matched8"]
+                    summary["matched7"] += res["matched7"]
 
                     if res["error"]:
                         summary["files_error"] += 1
