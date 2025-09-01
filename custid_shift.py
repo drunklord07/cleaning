@@ -3,8 +3,6 @@ import os
 import re
 import sys
 import time
-import traceback
-from pathlib import Path
 from datetime import datetime, timedelta
 from functools import lru_cache
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -134,7 +132,7 @@ def process_file(file_path: str) -> dict:
         "regex_counts": Counter(),
         "keyword_counts": Counter(),
         "custid_values": [],
-        "custid_lines": [],   # collect lines to return
+        "custid_lines": [],
         "error": None,
     }
 
@@ -151,8 +149,6 @@ def process_file(file_path: str) -> dict:
                 # --- Detect CustomerId ---
                 cust_match = CUSTID_RE.search(line)
                 custid = cust_match.group(1) if cust_match else None
-
-                # --- Skip empty [CustomerId:] ---
                 if custid == "":
                     custid = None
 
@@ -180,18 +176,16 @@ def process_file(file_path: str) -> dict:
 
                 # --- Apply rules ---
                 if custid:
-                    # Ignore MOBILE_REGEX if it only comes from inside [CustomerId:xxxx]
                     mobile_only = False
                     if regex_hit and not keyword_hit:
                         if regex_names == ["MOBILE_REGEX"]:
                             mobile_only = True
-                            regex_hit = False  # ignore mobile match
+                            regex_hit = False  # ignore mobile-only
 
                     if regex_hit or keyword_hit:
-                        f_out.write(raw)  # keep full line
+                        f_out.write(raw)
                         local["lines_kept"] += 1
                     else:
-                        # truncate to [CustomerId:xxxx] ;path
                         semi_idx = line.find(";")
                         if semi_idx != -1:
                             truncated = f"[CustomerId:{custid}] {line[semi_idx:]}"
@@ -204,16 +198,28 @@ def process_file(file_path: str) -> dict:
                         local["custid_values"].append(custid)
                 else:
                     if regex_hit or keyword_hit:
-                        f_out.write(raw)  # keep
+                        f_out.write(raw)
                         local["lines_kept"] += 1
                     else:
                         local["lines_removed"] += 1
 
     except Exception as e:
-        err = f"{local['file_name']}: {e.__class__.__name__}: {e}"
-        local["error"] = err
+        local["error"] = f"{local['file_name']}: {e.__class__.__name__}: {e}"
 
-    return local
+    # return only picklable types
+    return {
+        "file_name": local["file_name"],
+        "lines_processed": local["lines_processed"],
+        "lines_removed": local["lines_removed"],
+        "lines_kept": local["lines_kept"],
+        "custid_moved": local["custid_moved"],
+        "custid_mobile_only": local["custid_mobile_only"],
+        "regex_counts": dict(local["regex_counts"]),
+        "keyword_counts": dict(local["keyword_counts"]),
+        "custid_values": local["custid_values"],
+        "custid_lines": local["custid_lines"],
+        "error": local["error"],
+    }
 
 # ---------- Resume Log ----------
 def load_completed_set(log_path: str) -> set:
@@ -315,6 +321,7 @@ def main():
     }
 
     overall_bar = tqdm(total=len(pending_files), desc="Overall", unit="file", leave=True)
+    start_time = time.time()
 
     try:
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -331,8 +338,8 @@ def main():
                     summary["total_lines_removed"] += res["lines_removed"]
                     summary["total_custid_moved"] += res["custid_moved"]
                     summary["custid_mobile_only"] += res["custid_mobile_only"]
-                    summary["regex_counts"].update(res["regex_counts"])
-                    summary["keyword_counts"].update(res["keyword_counts"])
+                    summary["regex_counts"].update(Counter(res["regex_counts"]))
+                    summary["keyword_counts"].update(Counter(res["keyword_counts"]))
                     summary["custid_values"].extend(res["custid_values"])
                     summary["custid_lines"].extend(res["custid_lines"])
 
@@ -348,15 +355,14 @@ def main():
                     summary["errors"].append(f"{base_name}: worker exception: {e}")
                 overall_bar.update(1)
 
-                if summary["files_scanned"] > 0:
-                    elapsed = time.time() - overall_bar.start_t
-                    avg = elapsed / summary["files_scanned"]
-                    remaining = len(pending_files) - summary["files_scanned"]
-                    eta_seconds = max(0, remaining * avg)
-                    overall_bar.set_postfix_str(f"ETA: {str(timedelta(seconds=int(eta_seconds)))}")
+                elapsed = time.time() - start_time
+                avg = elapsed / max(1, summary["files_scanned"])
+                remaining = len(pending_files) - summary["files_scanned"]
+                eta_seconds = max(0, remaining * avg)
+                overall_bar.set_postfix_str(f"ETA: {str(timedelta(seconds=int(eta_seconds)))}")
+
     finally:
         overall_bar.close()
-        # write all custid lines once at end
         if summary["custid_lines"]:
             with open(os.path.join(CUSTID_FOLDER, "all_custid.txt"), "a", encoding="utf-8") as custid_out:
                 custid_out.writelines(summary["custid_lines"])
