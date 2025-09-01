@@ -121,8 +121,9 @@ for k, phrases in KEYWORD_PHRASES.items():
 
 # ---------- CustomerId regex ----------
 CUSTID_RE = re.compile(r"\[CustomerId:(.*?)\]")
+
 # ---------- Processing Function ----------
-def process_file(file_path: str, custid_out) -> dict:
+def process_file(file_path: str) -> dict:
     local = {
         "file_name": os.path.basename(file_path),
         "lines_processed": 0,
@@ -133,6 +134,7 @@ def process_file(file_path: str, custid_out) -> dict:
         "regex_counts": Counter(),
         "keyword_counts": Counter(),
         "custid_values": [],
+        "custid_lines": [],   # collect lines to return
         "error": None,
     }
 
@@ -195,7 +197,7 @@ def process_file(file_path: str, custid_out) -> dict:
                             truncated = f"[CustomerId:{custid}] {line[semi_idx:]}"
                         else:
                             truncated = f"[CustomerId:{custid}]"
-                        custid_out.write(truncated + "\n")
+                        local["custid_lines"].append(truncated + "\n")
                         local["custid_moved"] += 1
                         if mobile_only:
                             local["custid_mobile_only"] += 1
@@ -308,16 +310,15 @@ def main():
         "regex_counts": Counter(),
         "keyword_counts": Counter(),
         "custid_values": [],
-        "errors": []
+        "errors": [],
+        "custid_lines": []
     }
-
-    custid_out = open(os.path.join(CUSTID_FOLDER, "all_custid.txt"), "a", encoding="utf-8")
 
     overall_bar = tqdm(total=len(pending_files), desc="Overall", unit="file", leave=True)
 
     try:
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = {ex.submit(process_file, fp, custid_out): fp for fp in pending_files}
+            futures = {ex.submit(process_file, fp): fp for fp in pending_files}
             for fut in as_completed(futures):
                 file_path = futures[fut]
                 base_name = os.path.basename(file_path)
@@ -333,6 +334,7 @@ def main():
                     summary["regex_counts"].update(res["regex_counts"])
                     summary["keyword_counts"].update(res["keyword_counts"])
                     summary["custid_values"].extend(res["custid_values"])
+                    summary["custid_lines"].extend(res["custid_lines"])
 
                     if res["error"]:
                         summary["files_error"] += 1
@@ -354,7 +356,10 @@ def main():
                     overall_bar.set_postfix_str(f"ETA: {str(timedelta(seconds=int(eta_seconds)))}")
     finally:
         overall_bar.close()
-        custid_out.close()
+        # write all custid lines once at end
+        if summary["custid_lines"]:
+            with open(os.path.join(CUSTID_FOLDER, "all_custid.txt"), "a", encoding="utf-8") as custid_out:
+                custid_out.writelines(summary["custid_lines"])
         write_summary(summary)
 
 if __name__ == "__main__":
