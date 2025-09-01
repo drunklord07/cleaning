@@ -121,7 +121,6 @@ for k, phrases in KEYWORD_PHRASES.items():
 
 # ---------- CustomerId regex ----------
 CUSTID_RE = re.compile(r"\[CustomerId:(.*?)\]")
-
 # ---------- Processing Function ----------
 def process_file(file_path: str, custid_out) -> dict:
     local = {
