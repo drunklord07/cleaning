@@ -29,7 +29,7 @@ def ensure_folders():
 def process_file(file_path: Path) -> dict:
     """
     Process a single .txt file:
-    - Keeps only columns between first and last semicolon.
+    - Keeps only the 3 middle fields (4th, 3rd, 2nd from the right).
     - Writes cleaned lines to output file.
     """
     local_stats = {"lines_in": 0, "lines_out": 0, "errors": None}
@@ -44,14 +44,16 @@ def process_file(file_path: Path) -> dict:
                 if not line:
                     continue
                 local_stats["lines_in"] += 1
+
                 parts = [p.strip() for p in line.split(";")]
                 if len(parts) >= 5:
-                    # Keep only columns 2–4 (index 1, 2, 3)
-                    cleaned = " ; ".join(parts[1:4])
+                    # Always take 3 fields: 4th, 3rd, 2nd from the right
+                    cleaned_parts = parts[-4:-1]
+                    cleaned = " ; ".join(cleaned_parts)
                     fout.write(cleaned + "\n")
                     local_stats["lines_out"] += 1
                 else:
-                    # Skip malformed line but still count input
+                    # Skip malformed lines
                     continue
 
     except Exception as e:
