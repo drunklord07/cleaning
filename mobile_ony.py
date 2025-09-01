@@ -9,26 +9,63 @@ from datetime import datetime, timedelta
 from tqdm import tqdm
 
 # ====== CONFIGURATION ====== #
-INPUT_FOLDER  = "input_logs"           # Folder with .txt inputs (non-recursive)
-OUTPUT_FOLDER = "mobile_only_output"   # Filtered outputs (same basenames)
-SUMMARY_FILE  = "summary_report.txt"   # Saved in current working dir
-RESUME_LOG    = "resume_files.log"     # Checkpoint log
-MAX_WORKERS   = 6                      # Parallelism
-ALLOWED_EXTS  = (".txt",)              # *** Only .txt ***
+INPUT_FOLDER   = "input_logs"           # Folder with .txt inputs (non-recursive)
+OUTPUT_FOLDER  = "mobile_only_output"   # Filtered outputs (same basenames)
+SUMMARY_FILE   = "summary_report.txt"   # Saved in current working dir
+RESUME_LOG     = "resume_files.log"     # Checkpoint log
+MAX_WORKERS    = 6                      # Parallelism
+ALLOWED_EXTS   = (".txt",)              # *** Only .txt ***
+FIELD_NAME     = "CustomerId"           # Field label to append; change if needed
+EMIT_ONE_SPACE = True                   # Space between kept bracket and ';' tail
 # =========================== #
 
-# Mobile regex EXACTLY as in your reference
+# Mobile regex EXACTLY as requested
 MOBILE_REGEX = re.compile(r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])')
+
+# [CustomerId: ...] (case-sensitive "CustomerId")
+CUST_RE = re.compile(r"\[CustomerId:(.*?)\]")
+
+def sanitize_line(line_wo_nl: str, mobile_match: re.Match) -> str | None:
+    """
+    Apply CustomerId/semicolon sanitization and append metadata.
+    Returns final line (without trailing newline) or None to drop the line.
+    """
+    # Step A: locate first CustomerId bracket (if any)
+    cust_m = CUST_RE.search(line_wo_nl)
+    cust_token = cust_m.group(0) if cust_m else None
+
+    # Step B: find first semicolon
+    semi_idx = line_wo_nl.find(";")
+
+    # Step C: build sanitized base per rules
+    if cust_token:
+        if semi_idx >= 0:
+            tail = line_wo_nl[semi_idx:]  # keep from ';' inclusive
+            base = cust_token + ((" " + tail.lstrip()) if EMIT_ONE_SPACE else tail)
+        else:
+            base = cust_token  # no ';' → just the bracket
+    else:
+        if semi_idx >= 0:
+            base = line_wo_nl[semi_idx:]  # keep from ';' inclusive
+        else:
+            return None  # neither bracket nor ';' → drop the line
+
+    # Step D: append metadata: ; <FIELD_NAME> ; mobile_regex ; <match_value>
+    match_value = mobile_match.group(0)
+    final_line = f"{base} ; {FIELD_NAME} ; mobile_regex ; {match_value}"
+    return final_line
 
 def process_file(file_path: str) -> dict:
     """
-    Keep only lines containing a mobile number per MOBILE_REGEX.
+    Keep only lines containing a mobile number; sanitize and append metadata per rules.
     """
     local = {
         "file_name": os.path.basename(file_path),
         "lines_processed": 0,
         "lines_kept": 0,
         "lines_removed": 0,
+        "kept_with_bracket": 0,
+        "kept_without_bracket": 0,
         "error": None,
         "input_was_blank": False,
     }
@@ -47,14 +84,30 @@ def process_file(file_path: str) -> dict:
              open(out_path, "w", encoding="utf-8") as f_out:
 
             any_line = False
-            for line in f_in:
+            for raw in f_in:
                 any_line = True
                 local["lines_processed"] += 1
-                if MOBILE_REGEX.search(line):
-                    f_out.write(line)
-                    local["lines_kept"] += 1
-                else:
+                line = raw.rstrip("\n")
+
+                m = MOBILE_REGEX.search(line)
+                if not m:
                     local["lines_removed"] += 1
+                    continue
+
+                sanitized = sanitize_line(line, m)
+                if sanitized is None:
+                    # Had mobile, but neither bracket nor ';' → drop per rule
+                    local["lines_removed"] += 1
+                    continue
+
+                # Count bracket presence for telemetry
+                if CUST_RE.search(line):
+                    local["kept_with_bracket"] += 1
+                else:
+                    local["kept_without_bracket"] += 1
+
+                f_out.write(sanitized + "\n")
+                local["lines_kept"] += 1
 
             if not any_line:
                 local["input_was_blank"] = True
@@ -89,11 +142,12 @@ def append_completed(log_path: str, file_name: str):
 def write_summary(summary):
     summary["end_ts"] = time.time()
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-        f.write(f"Mobile-only Filter Summary - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Mobile-only Filter + CustomerId/Tail + Metadata - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Input Folder: {os.path.abspath(INPUT_FOLDER)}\n")
         f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n")
         f.write(f"Max Workers: {summary['max_workers']}\n")
-        f.write(f"Allowed Exts: {ALLOWED_EXTS}\n\n")
+        f.write(f"Allowed Exts: {ALLOWED_EXTS}\n")
+        f.write(f"Field name appended: {FIELD_NAME}\n\n")
 
         f.write("=== Files ===\n")
         f.write(f"Processed: {summary['files_scanned']}\n")
@@ -103,9 +157,11 @@ def write_summary(summary):
         f.write(f"Zero-kept outputs: {len(summary['zero_kept_files'])}\n\n")
 
         f.write("=== Lines (aggregate) ===\n")
-        f.write(f"Total scanned: {summary['total_lines_processed']}\n")
-        f.write(f"Total kept:    {summary['total_lines_kept']}\n")
-        f.write(f"Total removed: {summary['total_lines_removed']}\n")
+        f.write(f"Total scanned:         {summary['total_lines_processed']}\n")
+        f.write(f"Total kept:            {summary['total_lines_kept']}\n")
+        f.write(f"Total removed:         {summary['total_lines_removed']}\n")
+        f.write(f"Kept with bracket:     {summary['kept_with_bracket']}\n")
+        f.write(f"Kept without bracket:  {summary['kept_without_bracket']}\n")
 
         if summary["errors"]:
             f.write("\n=== Errors ===\n")
@@ -134,6 +190,7 @@ def main():
             "files_scanned": 0, "files_success": 0, "files_error": 0,
             "blank_input_files": [], "zero_kept_files": [], "errors": [],
             "total_lines_processed": 0, "total_lines_kept": 0, "total_lines_removed": 0,
+            "kept_with_bracket": 0, "kept_without_bracket": 0,
             "max_workers": MAX_WORKERS, "start_ts": time.time(), "end_ts": None,
         }
         write_summary(summary)
@@ -148,6 +205,7 @@ def main():
             "files_scanned": 0, "files_success": 0, "files_error": 0,
             "blank_input_files": [], "zero_kept_files": [], "errors": [],
             "total_lines_processed": 0, "total_lines_kept": 0, "total_lines_removed": 0,
+            "kept_with_bracket": 0, "kept_without_bracket": 0,
             "max_workers": MAX_WORKERS, "start_ts": time.time(), "end_ts": None,
         }
         write_summary(summary)
@@ -166,6 +224,8 @@ def main():
         "total_lines_processed": 0,
         "total_lines_kept": 0,
         "total_lines_removed": 0,
+        "kept_with_bracket": 0,
+        "kept_without_bracket": 0,
     }
 
     overall_bar = tqdm(total=len(pending_files), desc="Overall", unit="file", leave=True)
@@ -191,6 +251,8 @@ def main():
                 summary["total_lines_processed"] += res["lines_processed"]
                 summary["total_lines_kept"] += res["lines_kept"]
                 summary["total_lines_removed"] += res["lines_removed"]
+                summary["kept_with_bracket"] += res["kept_with_bracket"]
+                summary["kept_without_bracket"] += res["kept_without_bracket"]
 
                 if res["input_was_blank"]:
                     summary["blank_input_files"].append(res["file_name"])
