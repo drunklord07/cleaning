@@ -4,10 +4,8 @@
 import os
 import sys
 import re
-import time
-from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime
 from tqdm import tqdm
 
 # ====== CONFIGURATION ====== #
@@ -21,57 +19,56 @@ RESUME_LOG = "resume_extract.log"        # Checkpoint log in current working dir
 MAX_WORKERS = 6                          # Parallelism
 ALLOWED_EXTS = (".txt",)                 # Process only .txt files
 
-# OPTIONAL: set this to your original (pre-clean) input folder from the 4-case run
-# If provided, we'll compute Case 1–4 stats for comparison in the summary.
-CASE_SOURCE_FOLDER = ""                  # e.g., "input_test" or absolute path; "" = disabled
-MOBILE_REGEX = re.compile(r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])')
+# OPTIONAL: original (pre-clean) input folder from the 4-case run
+# If provided, we’ll compute Case 1–4 stats for comparison in the summary.
+CASE_SOURCE_FOLDER = ""                  # e.g. "input_test" or absolute path; "" = disabled
 # =========================== #
 
 FINAL_PATH = os.path.join(FINAL_FOLDER, FINAL_FILE)
 
-# ---- Robust matchers for the cleaned lines (extraction targets) ----
-# [Key:digits];path   -> move as-is (nonempty_no_mobile)
-RE_NO_MOBILE = re.compile(
-    r'^\s*\[(CustomerNo|Mobile-No)\s*:\s*([0-9]+)\s*\]\s*;\s*(\S.*)$'
-)
+# ---------- tolerant helpers for CLEANED lines ----------
+# First bracket token + remainder
+RE_HEAD = re.compile(r'^\s*(\[[^\]]*?\])\s*(.*)$')
 
-# [Key:digits] body;path  -> split into body;path (stay) + [Key:digits];path (final)
-RE_WITH_MOBILE_HEAD = re.compile(
-    r'^\s*\[(CustomerNo|Mobile-No)\s*:\s*([0-9]+)\s*\]\s*(.*)$'
-)
+# Inside the bracket, extract key + digits (tolerant spacing)
+RE_KEYVAL = re.compile(r'^\[\s*(CustomerNo|Mobile-No)\s*:\s*([0-9]+)\s*\]\s*$')
 
-# ---------------- Case classification from ORIGINAL (pre-clean) logs ----------------
-PREAMBLE_RE = re.compile(r'^\s*((?:\[[^\]]*\]\s*)+)(.*)$')  # leading contiguous [..]... block
+# ---------- ORIGINAL (pre-clean) case classification (optional) ----------
+PREAMBLE_RE = re.compile(r'^\s*((?:\[[^\]]*\]\s*)+)(.*)$')
 BRACKET_RE  = re.compile(r'\[[^\]]*\]')
+MOBILE_REGEX = re.compile(r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])')
 
 def classify_case_from_original(line: str) -> str:
-    """
-    Return 'case1'/'case2'/'case3'/'case4' or 'other' by looking at preamble
-    of ORIGINAL (pre-clean) lines: exact 10/6/9/8 bracket counts + required key.
-    """
     m = PREAMBLE_RE.match(line)
     if not m:
         return "other"
-    preamble, rest = m.groups()
+    preamble, _ = m.groups()
     tokens = BRACKET_RE.findall(preamble)
-    count = len(tokens)
+    cnt = len(tokens)
     joined = "".join(tokens)
-
     has_cust = "[CustomerNo:" in joined
     has_mob  = "[Mobile-No:" in joined
-
-    if count == 10 and has_cust:
+    if cnt == 10 and has_cust:
         return "case1"
-    if count == 6 and has_mob:
+    if cnt == 6 and has_mob:
         return "case2"
-    if count == 9 and has_mob:
+    if cnt == 9 and has_mob:
         return "case3"
-    if count == 8 and has_mob:
+    if cnt == 8 and has_mob:
         return "case4"
     return "other"
 
+def original_key_is_nonempty(line: str) -> bool:
+    m = PREAMBLE_RE.match(line)
+    if not m:
+        return False
+    preamble = m.group(1)
+    m1 = re.search(r'\[CustomerNo\s*:\s*([^\]]*)\]', preamble)
+    m2 = re.search(r'\[Mobile-No\s*:\s*([^\]]*)\]', preamble)
+    val = (m1.group(1) if m1 else (m2.group(1) if m2 else None))
+    return bool(val and val.strip())
+
 def original_body_has_mobile(line: str) -> bool:
-    """From ORIGINAL line: check if the body (before the LAST ';') contains a mobile."""
     m = PREAMBLE_RE.match(line)
     if not m:
         return False
@@ -81,43 +78,18 @@ def original_body_has_mobile(line: str) -> bool:
     body, _ = rest.rsplit(";", 1)
     return bool(MOBILE_REGEX.search(body))
 
-def original_key_is_nonempty(line: str) -> bool:
-    """Check that kept key (CustomerNo/Mobile-No) in ORIGINAL line is non-empty."""
-    m = PREAMBLE_RE.match(line)
-    if not m:
-        return False
-    preamble = m.group(1)
-    # Look for first occurrence of either key with any spacing inside
-    m1 = re.search(r'\[CustomerNo\s*:\s*([^\]]*)\]', preamble)
-    m2 = re.search(r'\[Mobile-No\s*:\s*([^\]]*)\]', preamble)
-    val = None
-    if m1:
-        val = m1.group(1)
-    elif m2:
-        val = m2.group(1)
-    if val is None:
-        return False
-    return val.strip() != ""
-
 def scan_case_source_folder(folder: str):
-    """
-    Scan ORIGINAL pre-clean folder to produce per-case counts:
-    - moved   = nonempty_no_mobile
-    - split   = nonempty_with_mobile
-    """
     results = {f"case{i}": {"no_mobile": 0, "with_mobile": 0} for i in range(1,5)}
     if not folder or not os.path.isdir(folder):
-        return None  # disabled or missing
-
+        return None
     files = sorted(
         os.path.join(folder, f)
         for f in os.listdir(folder)
         if os.path.isfile(os.path.join(folder, f))
-           and os.path.splitext(f)[1].lower() in ALLOWED_EXTS
+        and os.path.splitext(f)[1].lower() in ALLOWED_EXTS
     )
-
-    for path in files:
-        with open(path, "r", encoding="utf-8", errors="ignore") as fin:
+    for p in files:
+        with open(p, "r", encoding="utf-8", errors="ignore") as fin:
             for raw in fin:
                 s = raw.rstrip("\n")
                 cid = classify_case_from_original(s)
@@ -131,15 +103,15 @@ def scan_case_source_folder(folder: str):
                     results[cid]["no_mobile"] += 1
     return results
 
-# -------------------- Extraction worker over CLEANED lines --------------------
+# ---------- extraction worker over CLEANED lines ----------
 def process_file(file_path: str):
     local = {
         "file_name": os.path.basename(file_path),
         "lines_processed": 0,
-        "lines_modified": 0,      # split count
-        "lines_removed": 0,       # moved (no mobile) count
-        "nonempty_no_mobile": 0,  # moved
-        "nonempty_with_mobile": 0,# split
+        "lines_modified": 0,       # split count
+        "lines_removed": 0,        # moved count
+        "nonempty_no_mobile": 0,   # moved
+        "nonempty_with_mobile": 0, # split
         "output_lines": 0,
         "bracket_lines": [],
         "error": None,
@@ -154,39 +126,50 @@ def process_file(file_path: str):
                 local["lines_processed"] += 1
                 line = raw.rstrip("\n")
 
-                # 1) [Key:digits];path  -> move as-is
-                m0 = RE_NO_MOBILE.match(line)
-                if m0:
-                    # exact line goes to final file, removed from rewritten output
-                    local["nonempty_no_mobile"] += 1
-                    local["lines_removed"] += 1
-                    local["bracket_lines"].append(line)
+                # Try to parse "[...]" head and remainder
+                mhead = RE_HEAD.match(line)
+                if not mhead:
+                    # no bracket head → unchanged
+                    f_out.write(line + "\n")
+                    local["output_lines"] += 1
                     continue
 
-                # 2) [Key:digits] body;path  -> split (last semicolon is the path)
-                m1 = RE_WITH_MOBILE_HEAD.match(line)
-                if m1:
-                    key_type, key_val, tail = m1.groups()
-                    if ";" in tail:
-                        body, path = tail.rsplit(";", 1)
-                        body, path = body.strip(), path.strip()
+                bracket, tail = mhead.groups()
 
-                        # write bracket+path to final file
-                        local["bracket_lines"].append(f"[{key_type}:{key_val}];{path}")
-                        local["nonempty_with_mobile"] += 1
+                # Validate bracket is [CustomerNo:digits] or [Mobile-No:digits]
+                if not RE_KEYVAL.match(bracket):
+                    # head bracket isn't the kept key → unchanged
+                    f_out.write(line + "\n")
+                    local["output_lines"] += 1
+                    continue
 
-                        # write body+path back to rewritten output
-                        f_out.write(f"{body};{path}\n")
-                        local["lines_modified"] += 1
-                        local["output_lines"] += 1
-                        continue
-                    # If no ';' (unexpected), just pass through unchanged
-                    # (shouldn't happen given prior step guarantees)
-                    # fall through
+                # Must have a path separated by the LAST ';'
+                if ";" not in tail:
+                    # unexpected, keep unchanged
+                    f_out.write(line + "\n")
+                    local["output_lines"] += 1
+                    continue
 
-                # 3) Everything else unchanged
-                f_out.write(line + "\n")
-                local["output_lines"] += 1
+                body, path = tail.rsplit(";", 1)
+                body, path = body.strip(), path.strip()
+
+                if body == "":
+                    # This is the "nonempty_no_mobile" shape → move as-is
+                    local["nonempty_no_mobile"] += 1
+                    local["lines_removed"] += 1
+                    # exact original line to final file
+                    local["bracket_lines"].append(f"{bracket};{path}")
+                    continue
+                else:
+                    # "nonempty_with_mobile" shape → split
+                    local["nonempty_with_mobile"] += 1
+                    local["lines_modified"] += 1
+                    # bracket+path to final
+                    local["bracket_lines"].append(f"{bracket};{path}")
+                    # body+path stays in rewritten output
+                    f_out.write(f"{body};{path}\n")
+                    local["output_lines"] += 1
+                    continue
 
     except Exception as e:
         try:
@@ -198,7 +181,7 @@ def process_file(file_path: str):
 
     return local
 
-# -------------------- Resume log helpers --------------------
+# ---------- resume helpers ----------
 def load_completed_set(log_path: str):
     completed = set()
     if os.path.exists(log_path):
@@ -213,7 +196,7 @@ def append_completed(log_path: str, file_name: str):
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(file_name + "\n")
 
-# -------------------- Summary --------------------
+# ---------- summary ----------
 def write_summary(summary, case_baseline):
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
         f.write(f"Bracket Extraction Summary - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -223,17 +206,18 @@ def write_summary(summary, case_baseline):
         f.write(f"Final File: {FINAL_PATH}\n")
         f.write(f"Max Workers: {summary['max_workers']}\n\n")
 
-        # Optional: Per-case stats from ORIGINAL folder
+        # Case-wise (from ORIGINAL) if available
         f.write("=== Case-wise (from ORIGINAL input, if provided) ===\n")
         if case_baseline is None:
-            f.write("N/A (Set CASE_SOURCE_FOLDER to enable case-wise stats)\n\n")
+            f.write("N/A (set CASE_SOURCE_FOLDER to enable)\n\n")
         else:
+            tot_w = tot_n = 0
             for i in range(1,5):
-                f.write(f"Case {i}: nonempty_with_mobile={case_baseline[f'case{i}']['with_mobile']}, "
-                        f"nonempty_no_mobile={case_baseline[f'case{i}']['no_mobile']}\n")
-            total_with = sum(case_baseline[f'case{i}']['with_mobile'] for i in range(1,5))
-            total_nom  = sum(case_baseline[f'case{i}']['no_mobile'] for i in range(1,5))
-            f.write(f"Case totals: with_mobile={total_with}, no_mobile={total_nom}\n\n")
+                w = case_baseline[f'case{i}']['with_mobile']
+                n = case_baseline[f'case{i}']['no_mobile']
+                tot_w += w; tot_n += n
+                f.write(f"Case {i}: nonempty_with_mobile={w}, nonempty_no_mobile={n}\n")
+            f.write(f"Case totals: with_mobile={tot_w}, no_mobile={tot_n}\n\n")
 
         f.write("=== Totals (this extraction run) ===\n")
         f.write(f"Files processed : {summary['files_scanned']}\n")
@@ -247,14 +231,12 @@ def write_summary(summary, case_baseline):
         f.write(f"Updated line count in output files: {summary['updated_line_count']}\n")
         f.write(f"Total lines written in {FINAL_FILE}: {summary['final_file_lines']}\n\n")
 
-        # Consistency checks (same as we validated):
+        # Consistency checks
         expected_output_lines = summary['total_lines_processed'] - summary['nonempty_no_mobile']
         check_a_ok = (summary['total_lines_processed'] ==
                       summary['updated_line_count'] + summary['nonempty_no_mobile'])
-
         expected_final_file_lines = summary['nonempty_no_mobile'] + summary['nonempty_with_mobile']
         check_b_ok = (summary['final_file_lines'] == expected_final_file_lines)
-
         lhs = summary['updated_line_count'] + summary['final_file_lines']
         rhs = summary['total_lines_processed'] + summary['nonempty_with_mobile']
         check_c_ok = (lhs == rhs)
@@ -264,12 +246,9 @@ def write_summary(summary, case_baseline):
                 f"{summary['total_lines_processed']} == {summary['updated_line_count']} + {summary['nonempty_no_mobile']}  "
                 f"=> {'PASS' if check_a_ok else 'FAIL'}\n")
         f.write(f"   Expected Rewritten (computed)             : {expected_output_lines}\n")
-
         f.write(f"B) Final file lines == Moved + Split         : "
                 f"{summary['final_file_lines']} == {summary['nonempty_no_mobile']} + {summary['nonempty_with_mobile']}  "
                 f"=> {'PASS' if check_b_ok else 'FAIL'}\n")
-        f.write(f"   Expected Final File Lines (computed)      : {expected_final_file_lines}\n")
-
         f.write(f"C) Rewritten + Final == Original + Splits    : "
                 f"{lhs} == {rhs}  => {'PASS' if check_c_ok else 'FAIL'}\n\n")
 
@@ -278,7 +257,7 @@ def write_summary(summary, case_baseline):
             for e in summary["errors"]:
                 f.write(f"- {e}\n")
 
-# -------------------- Main --------------------
+# ---------- main ----------
 def main():
     if not os.path.isdir(INPUT_FOLDER):
         print(f"ERROR: INPUT_FOLDER does not exist: {INPUT_FOLDER}", file=sys.stderr)
@@ -291,16 +270,14 @@ def main():
         os.path.join(INPUT_FOLDER, f)
         for f in os.listdir(INPUT_FOLDER)
         if os.path.isfile(os.path.join(INPUT_FOLDER, f))
-           and os.path.splitext(f)[1].lower() in ALLOWED_EXTS
+        and os.path.splitext(f)[1].lower() in ALLOWED_EXTS
     )
     if not all_files:
         print(f"No {ALLOWED_EXTS} files found in INPUT_FOLDER.", file=sys.stderr)
         return
 
-    # Optional per-case baseline from ORIGINAL folder
     case_baseline = scan_case_source_folder(CASE_SOURCE_FOLDER) if CASE_SOURCE_FOLDER else None
 
-    # Resume
     completed = set()
     if os.path.exists(RESUME_LOG):
         with open(RESUME_LOG, "r", encoding="utf-8") as f:
@@ -352,14 +329,12 @@ def main():
                     summary["nonempty_with_mobile"] += res["nonempty_with_mobile"]
                     summary["updated_line_count"] += res["output_lines"]
 
-                    # Append bracket lines to final file
                     if res["bracket_lines"]:
                         with open(FINAL_PATH, "a", encoding="utf-8") as f:
                             for l in res["bracket_lines"]:
                                 f.write(l + "\n")
                                 summary["final_file_lines"] += 1
 
-                    # mark resume
                     with open(RESUME_LOG, "a", encoding="utf-8") as r:
                         r.write(base_name + "\n")
 
@@ -369,9 +344,6 @@ def main():
                     summary["files_error"] += 1
                     summary["errors"].append(f"{base_name}: worker exception: {e}")
                 overall_bar.update(1)
-                # ETA
-                elapsed = max(0.0, summary["files_scanned"])  # avoid div by zero
-                # (lightweight ETA: omit for simplicity; tqdm shows time)
     finally:
         overall_bar.close()
         write_summary(summary, case_baseline)
