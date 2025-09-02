@@ -1,276 +1,110 @@
 #!/usr/bin/env python3
 import os
 import sys
-import time
-import re
-import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from pathlib import Path
 from tqdm import tqdm
 
-# ====== CONFIGURATION ====== #
-INPUT_FOLDER   = "input_logs"           # Folder with .txt inputs (non-recursive)
-OUTPUT_FOLDER  = "mobile_only_output"   # Filtered outputs (same basenames)
-SUMMARY_FILE   = "summary_report.txt"   # Saved in current working dir
-RESUME_LOG     = "resume_files.log"     # Checkpoint log
-MAX_WORKERS    = 6                      # Parallelism
-ALLOWED_EXTS   = (".txt",)              # *** Only .txt ***
-EMIT_ONE_SPACE = True                   # Space between kept bracket and ';' tail
-# =========================== #
+# ===== CONFIGURATION ===== #
+INPUT_FOLDER = "mobile_only_output"     # folder with input .txt files
+OUTPUT_FOLDER = "cleaned_output"        # folder to write cleaned files
+SUMMARY_FILE = "cleanup_summary.txt"    # summary report
+ALLOWED_EXTS = (".txt",)
+# ========================= #
 
-# Mobile regex EXACTLY as requested
-MOBILE_REGEX = re.compile(r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])')
-
-# Accepts [CustomerNo:...] or [Mobile-No:...]
-CUST_RE = re.compile(r"\[(CustomerNo|Mobile-No):(.*?)\]")
-
-def sanitize_line(line_wo_nl: str, mobile_match: re.Match) -> str | None:
-    """
-    Apply CustomerNo/Mobile-No + semicolon sanitization and append metadata.
-    Returns final line (without trailing newline) or None to drop the line.
-    """
-    # Step A: locate bracket
-    cust_m = CUST_RE.search(line_wo_nl)
-    cust_token = cust_m.group(0) if cust_m else None
-    field_name = cust_m.group(1) if cust_m else "UnknownField"
-
-    # Step B: find first semicolon
-    semi_idx = line_wo_nl.find(";")
-
-    # Step C: build sanitized base
-    if cust_token:
-        if semi_idx >= 0:
-            tail = line_wo_nl[semi_idx:]
-            base = cust_token + ((" " + tail.lstrip()) if EMIT_ONE_SPACE else tail)
-        else:
-            base = cust_token
-    else:
-        if semi_idx >= 0:
-            base = line_wo_nl[semi_idx:]
-        else:
-            return None
-
-    # Step D: append metadata with correct field name
-    match_value = mobile_match.group(0)
-    final_line = f"{base} ; {field_name} ; mobile_regex ; {match_value}"
-    return final_line
-
-def process_file(file_path: str) -> dict:
-    """
-    Keep only lines containing a mobile number; sanitize and append metadata per rules.
-    """
-    local = {
-        "file_name": os.path.basename(file_path),
-        "lines_processed": 0,
-        "lines_kept": 0,
-        "lines_removed": 0,
-        "kept_with_bracket": 0,
-        "kept_without_bracket": 0,
-        "error": None,
-        "input_was_blank": False,
+def process_file(file_path: Path) -> dict:
+    stats = {
+        "file": file_path.name,
+        "total": 0,
+        "modified": 0,
+        "space": 0,
+        "dash": 0,
+        "dash_space": 0,
+        "specials": []  # collect offending lines
     }
 
-    out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
+    out_path = Path(OUTPUT_FOLDER) / file_path.name
 
-    # Clean any stale partial from a previous failed attempt
-    try:
-        if os.path.exists(out_path):
-            os.remove(out_path)
-    except Exception:
-        pass
+    with file_path.open("r", encoding="utf-8", errors="ignore") as f_in, \
+         out_path.open("w", encoding="utf-8") as f_out:
 
-    try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f_in, \
-             open(out_path, "w", encoding="utf-8") as f_out:
+        for line in f_in:
+            stats["total"] += 1
+            original = line.rstrip("\n")
 
-            any_line = False
-            for raw in f_in:
-                any_line = True
-                local["lines_processed"] += 1
-                line = raw.rstrip("\n")
+            # Case 1: line starts with space
+            if original.startswith(" "):
+                new_line = original.lstrip(" ")
+                stats["modified"] += 1
+                stats["space"] += 1
 
-                m = MOBILE_REGEX.search(line)
-                if not m:
-                    local["lines_removed"] += 1
-                    continue
+            # Case 2: line starts with "- "
+            elif original.startswith("- "):
+                new_line = original[2:]
+                stats["modified"] += 1
+                stats["dash_space"] += 1
 
-                sanitized = sanitize_line(line, m)
-                if sanitized is None:
-                    local["lines_removed"] += 1
-                    continue
+            # Case 3: line starts with "-" but not "- "
+            elif original.startswith("-"):
+                new_line = original[1:]
+                stats["modified"] += 1
+                stats["dash"] += 1
 
-                if CUST_RE.search(line):
-                    local["kept_with_bracket"] += 1
-                else:
-                    local["kept_without_bracket"] += 1
+            # Case 4: other leading special char
+            elif original and not original[0].isalnum():
+                new_line = original
+                stats["specials"].append(original)
 
-                f_out.write(sanitized + "\n")
-                local["lines_kept"] += 1
+            else:
+                new_line = original
 
-            if not any_line:
-                local["input_was_blank"] = True
+            f_out.write(new_line + "\n")
 
-    except Exception as e:
-        try:
-            if os.path.exists(out_path):
-                os.remove(out_path)
-        except Exception:
-            pass
-        err = f"{local['file_name']}: {e.__class__.__name__}: {e}"
-        err += "\n" + "".join(traceback.format_exception_only(type(e), e)).strip()
-        local["error"] = err
+    return stats
 
-    return local
+def write_summary(all_stats: list):
+    total_lines = sum(s["total"] for s in all_stats)
+    total_modified = sum(s["modified"] for s in all_stats)
+    space = sum(s["space"] for s in all_stats)
+    dash = sum(s["dash"] for s in all_stats)
+    dash_space = sum(s["dash_space"] for s in all_stats)
+    specials = sum(len(s["specials"]) for s in all_stats)
 
-def load_completed_set(log_path: str) -> set:
-    completed = set()
-    if os.path.exists(log_path):
-        with open(log_path, "r", encoding="utf-8") as f:
-            for line in f:
-                name = line.strip()
-                if name and not line.startswith("#"):
-                    completed.add(name)
-    return completed
-
-def append_completed(log_path: str, file_name: str):
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(file_name + "\n")
-
-def write_summary(summary):
-    summary["end_ts"] = time.time()
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-        f.write(f"Mobile-only Filter + CustomerNo/Mobile-No + Metadata - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Input Folder: {os.path.abspath(INPUT_FOLDER)}\n")
-        f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n")
-        f.write(f"Max Workers: {summary['max_workers']}\n")
-        f.write(f"Allowed Exts: {ALLOWED_EXTS}\n\n")
+        f.write("=== Cleanup Summary ===\n\n")
+        f.write(f"Total lines processed: {total_lines}\n")
+        f.write(f"Total lines modified:  {total_modified}\n")
+        f.write(f"  - Starting with space:      {space}\n")
+        f.write(f"  - Starting with dash only:  {dash}\n")
+        f.write(f"  - Starting with '- ':       {dash_space}\n")
+        f.write(f"Other special leading chars:  {specials}\n\n")
 
-        f.write("=== Files ===\n")
-        f.write(f"Processed: {summary['files_scanned']}\n")
-        f.write(f"Success:   {summary['files_success']}\n")
-        f.write(f"Errors:    {summary['files_error']}\n")
-        f.write(f"Blank inputs: {len(summary['blank_input_files'])}\n")
-        f.write(f"Zero-kept outputs: {len(summary['zero_kept_files'])}\n\n")
-
-        f.write("=== Lines (aggregate) ===\n")
-        f.write(f"Total scanned:         {summary['total_lines_processed']}\n")
-        f.write(f"Total kept:            {summary['total_lines_kept']}\n")
-        f.write(f"Total removed:         {summary['total_lines_removed']}\n")
-        f.write(f"Kept with bracket:     {summary['kept_with_bracket']}\n")
-        f.write(f"Kept without bracket:  {summary['kept_without_bracket']}\n")
-
-        if summary["errors"]:
-            f.write("\n=== Errors ===\n")
-            for err in summary["errors"]:
-                f.write(f"- {err}\n")
+        if specials > 0:
+            f.write("=== Offending lines (other specials) ===\n")
+            for s in all_stats:
+                if s["specials"]:
+                    f.write(f"\nFile: {s['file']}\n")
+                    for line in s["specials"]:
+                        f.write(f"  {line}\n")
 
 def main():
-    if not os.path.isdir(INPUT_FOLDER):
-        print(f"ERROR: INPUT_FOLDER does not exist: {INPUT_FOLDER}", file=sys.stderr)
-        sys.exit(1)
+    input_folder = Path(INPUT_FOLDER)
+    output_folder = Path(OUTPUT_FOLDER)
+    output_folder.mkdir(parents=True, exist_ok=True)
 
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    files = sorted([f for f in input_folder.iterdir()
+                    if f.is_file() and f.suffix.lower() in ALLOWED_EXTS])
 
-    all_files = sorted(
-        os.path.join(INPUT_FOLDER, f)
-        for f in os.listdir(INPUT_FOLDER)
-        if os.path.isfile(os.path.join(INPUT_FOLDER, f))
-        and os.path.splitext(f)[1].lower() in ALLOWED_EXTS
-    )
-
-    if not all_files:
-        print(f"No {ALLOWED_EXTS} files found in INPUT_FOLDER.", file=sys.stderr)
-        summary = {
-            "files_scanned": 0, "files_success": 0, "files_error": 0,
-            "blank_input_files": [], "zero_kept_files": [], "errors": [],
-            "total_lines_processed": 0, "total_lines_kept": 0, "total_lines_removed": 0,
-            "kept_with_bracket": 0, "kept_without_bracket": 0,
-            "max_workers": MAX_WORKERS, "start_ts": time.time(), "end_ts": None,
-        }
-        write_summary(summary)
+    if not files:
+        print(f"No {ALLOWED_EXTS} files found in {INPUT_FOLDER}")
         return
 
-    completed = load_completed_set(RESUME_LOG)
-    pending_files = [fp for fp in all_files if os.path.basename(fp) not in completed]
+    all_stats = []
+    for file_path in tqdm(files, desc="Processing files", unit="file"):
+        stats = process_file(file_path)
+        all_stats.append(stats)
 
-    if not pending_files:
-        print("All files already processed per resume log. Nothing to do.")
-        summary = {
-            "files_scanned": 0, "files_success": 0, "files_error": 0,
-            "blank_input_files": [], "zero_kept_files": [], "errors": [],
-            "total_lines_processed": 0, "total_lines_kept": 0, "total_lines_removed": 0,
-            "kept_with_bracket": 0, "kept_without_bracket": 0,
-            "max_workers": MAX_WORKERS, "start_ts": time.time(), "end_ts": None,
-        }
-        write_summary(summary)
-        return
-
-    summary = {
-        "start_ts": time.time(),
-        "end_ts": None,
-        "max_workers": MAX_WORKERS,
-        "files_scanned": 0,
-        "files_success": 0,
-        "files_error": 0,
-        "blank_input_files": [],
-        "zero_kept_files": [],
-        "errors": [],
-        "total_lines_processed": 0,
-        "total_lines_kept": 0,
-        "total_lines_removed": 0,
-        "kept_with_bracket": 0,
-        "kept_without_bracket": 0,
-    }
-
-    overall_bar = tqdm(total=len(pending_files), desc="Overall", unit="file", leave=True)
-
-    try:
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = {ex.submit(process_file, fp): fp for fp in pending_files}
-
-            for fut in as_completed(futures):
-                file_path = futures[fut]
-                base_name = os.path.basename(file_path)
-
-                try:
-                    res = fut.result()
-                except Exception as e:
-                    summary["files_scanned"] += 1
-                    summary["files_error"] += 1
-                    summary["errors"].append(f"{base_name}: worker exception: {e}")
-                    overall_bar.update(1)
-                    continue
-
-                summary["files_scanned"] += 1
-                summary["total_lines_processed"] += res["lines_processed"]
-                summary["total_lines_kept"] += res["lines_kept"]
-                summary["total_lines_removed"] += res["lines_removed"]
-                summary["kept_with_bracket"] += res["kept_with_bracket"]
-                summary["kept_without_bracket"] += res["kept_without_bracket"]
-
-                if res["input_was_blank"]:
-                    summary["blank_input_files"].append(res["file_name"])
-                if res["lines_processed"] > 0 and res["lines_kept"] == 0:
-                    summary["zero_kept_files"].append(res["file_name"])
-
-                if res["error"]:
-                    summary["files_error"] += 1
-                    summary["errors"].append(res["error"])
-                else:
-                    summary["files_success"] += 1
-                    append_completed(RESUME_LOG, base_name)
-
-                overall_bar.update(1)
-
-                elapsed = time.time() - summary["start_ts"]
-                avg = elapsed / max(1, summary["files_scanned"])
-                remaining = len(pending_files) - summary["files_scanned"]
-                eta = max(0, int(remaining * avg))
-                overall_bar.set_postfix_str(f"ETA: {str(timedelta(seconds=eta))}")
-
-    finally:
-        overall_bar.close()
-        write_summary(summary)
+    write_summary(all_stats)
+    print(f"\nSummary written to {SUMMARY_FILE}")
 
 if __name__ == "__main__":
     main()
