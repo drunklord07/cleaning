@@ -24,6 +24,24 @@ ALLOWED_EXTS = (".txt",)                  # Process only .txt files
 
 FINAL_PATH = os.path.join(FINAL_FOLDER, FINAL_FILE)
 
+# Regex for general matching
+NONEMPTY_NO_MOBILE_RE = re.compile(r'^\[(CustomerNo|Mobile-No):\s*\d+\]\s*;.+$')
+NONEMPTY_WITH_MOBILE_RE = re.compile(r'^\[(CustomerNo|Mobile-No):\s*\d+\](.+)$')
+
+def classify_case(line: str):
+    """Classify line into case1–case4 based on bracket count and key."""
+    brackets = re.findall(r'\[[^\]]*\]', line)
+    count = len(brackets)
+    if "[CustomerNo:" in line and count == 10:
+        return "case1"
+    if "[Mobile-No:" in line and count == 6:
+        return "case2"
+    if "[Mobile-No:" in line and count == 9:
+        return "case3"
+    if "[Mobile-No:" in line and count == 8:
+        return "case4"
+    return "other"
+
 def process_file(file_path: str):
     local = {
         "file_name": os.path.basename(file_path),
@@ -35,6 +53,7 @@ def process_file(file_path: str):
         "output_lines": 0,
         "bracket_lines": [],
         "error": None,
+        "cases": {f"case{i}": {"no_mobile": 0, "with_mobile": 0} for i in range(1,5)},
     }
     out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
 
@@ -46,25 +65,34 @@ def process_file(file_path: str):
                 local["lines_processed"] += 1
                 line = raw.rstrip("\n")
 
-                # nonempty_no_mobile pattern: [Key:xxxx];path
-                if re.match(r'^\[(CustomerNo|Mobile-No):[0-9]+\];.+$', line):
+                case = classify_case(line)
+
+                # nonempty_no_mobile
+                if NONEMPTY_NO_MOBILE_RE.match(line):
                     local["nonempty_no_mobile"] += 1
                     local["lines_removed"] += 1
                     local["bracket_lines"].append(line)
-                    continue  # removed from original
+                    if case.startswith("case"):
+                        local["cases"][case]["no_mobile"] += 1
+                    continue
 
-                # nonempty_with_mobile pattern: [Key:xxxx] body;path
-                m = re.match(r'^\[(CustomerNo|Mobile-No):([0-9]+)\](.+)$', line)
+                # nonempty_with_mobile
+                m = NONEMPTY_WITH_MOBILE_RE.match(line)
                 if m and ";" in line:
-                    key_type, key_val, rest = m.groups()
-                    body, path = rest.rsplit(";", 1)  # use last semicolon
+                    key = m.group(0).split("]")[0] + "]"
+                    rest = line[len(key):]
+                    if ";" not in rest:
+                        f_out.write(line + "\n")
+                        local["output_lines"] += 1
+                        continue
+                    body, path = rest.rsplit(";", 1)
                     body, path = body.strip(), path.strip()
 
-                    # Bracket+path goes to brackets_final file
-                    local["bracket_lines"].append(f"[{key_type}:{key_val}];{path}")
+                    local["bracket_lines"].append(f"{key};{path}")
                     local["nonempty_with_mobile"] += 1
+                    if case.startswith("case"):
+                        local["cases"][case]["with_mobile"] += 1
 
-                    # Replace in original: keep body+path only
                     new_line = f"{body};{path}"
                     f_out.write(new_line + "\n")
 
@@ -108,7 +136,13 @@ def write_summary(summary):
         f.write(f"Final File: {FINAL_PATH}\n")
         f.write(f"Max Workers: {summary['max_workers']}\n\n")
 
-        f.write("=== Counts ===\n")
+        # Per-case stats
+        for i in range(1,5):
+            f.write(f"=== Case {i} ===\n")
+            f.write(f"nonempty_with_mobile: {summary['cases'][f'case{i}']['with_mobile']}\n")
+            f.write(f"nonempty_no_mobile : {summary['cases'][f'case{i}']['no_mobile']}\n\n")
+
+        f.write("=== Totals ===\n")
         f.write(f"Files processed : {summary['files_scanned']}\n")
         f.write(f"Files success   : {summary['files_success']}\n")
         f.write(f"Files error     : {summary['files_error']}\n")
@@ -120,7 +154,7 @@ def write_summary(summary):
         f.write(f"Updated line count in output files: {summary['updated_line_count']}\n")
         f.write(f"Total lines written in {FINAL_FILE}: {summary['final_file_lines']}\n\n")
 
-        # ---- Consistency checks ----
+        # Consistency checks
         expected_output_lines = summary['total_lines_processed'] - summary['nonempty_no_mobile']
         check_a_ok = (summary['total_lines_processed'] ==
                       summary['updated_line_count'] + summary['nonempty_no_mobile'])
@@ -186,7 +220,8 @@ def main():
         "nonempty_with_mobile": 0,
         "updated_line_count": 0,
         "final_file_lines": 0,
-        "errors": []
+        "errors": [],
+        "cases": {f"case{i}": {"no_mobile": 0, "with_mobile": 0} for i in range(1,5)},
     }
 
     overall_bar = tqdm(total=len(pending_files), desc="Overall", unit="file", leave=True)
@@ -205,6 +240,10 @@ def main():
                     summary["nonempty_no_mobile"] += res["nonempty_no_mobile"]
                     summary["nonempty_with_mobile"] += res["nonempty_with_mobile"]
                     summary["updated_line_count"] += res["output_lines"]
+
+                    for i in range(1,5):
+                        summary["cases"][f"case{i}"]["no_mobile"] += res["cases"][f"case{i}"]["no_mobile"]
+                        summary["cases"][f"case{i}"]["with_mobile"] += res["cases"][f"case{i}"]["with_mobile"]
 
                     # Append bracket lines to final file
                     if res["bracket_lines"]:
