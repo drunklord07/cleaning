@@ -15,14 +15,13 @@ SUMMARY_FILE   = "summary_report.txt"   # Saved in current working dir
 RESUME_LOG     = "resume_files.log"     # Checkpoint log
 MAX_WORKERS    = 6                      # Parallelism
 ALLOWED_EXTS   = (".txt",)              # *** Only .txt ***
-FIELD_NAME     = "CustomerId"           # Field label to append; change if needed
 EMIT_ONE_SPACE = True                   # Space between kept bracket and ';' tail
 # =========================== #
 
 # Mobile regex EXACTLY as requested
 MOBILE_REGEX = re.compile(r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])')
 
-# Only [CustomerNo:...] or [Mobile-No:]
+# Accepts [CustomerNo:...] or [Mobile-No:...]
 CUST_RE = re.compile(r"\[(CustomerNo|Mobile-No):(.*?)\]")
 
 def sanitize_line(line_wo_nl: str, mobile_match: re.Match) -> str | None:
@@ -30,29 +29,30 @@ def sanitize_line(line_wo_nl: str, mobile_match: re.Match) -> str | None:
     Apply CustomerNo/Mobile-No + semicolon sanitization and append metadata.
     Returns final line (without trailing newline) or None to drop the line.
     """
-    # Step A: locate first bracket (CustomerNo/Mobile-No)
+    # Step A: locate bracket
     cust_m = CUST_RE.search(line_wo_nl)
     cust_token = cust_m.group(0) if cust_m else None
+    field_name = cust_m.group(1) if cust_m else "UnknownField"
 
     # Step B: find first semicolon
     semi_idx = line_wo_nl.find(";")
 
-    # Step C: build sanitized base per rules
+    # Step C: build sanitized base
     if cust_token:
         if semi_idx >= 0:
-            tail = line_wo_nl[semi_idx:]  # keep from ';' inclusive
+            tail = line_wo_nl[semi_idx:]
             base = cust_token + ((" " + tail.lstrip()) if EMIT_ONE_SPACE else tail)
         else:
-            base = cust_token  # no ';' → just the bracket
+            base = cust_token
     else:
         if semi_idx >= 0:
-            base = line_wo_nl[semi_idx:]  # keep from ';' inclusive
+            base = line_wo_nl[semi_idx:]
         else:
-            return None  # neither bracket nor ';' → drop the line
+            return None
 
-    # Step D: append metadata
+    # Step D: append metadata with correct field name
     match_value = mobile_match.group(0)
-    final_line = f"{base} ; {FIELD_NAME} ; mobile_regex ; {match_value}"
+    final_line = f"{base} ; {field_name} ; mobile_regex ; {match_value}"
     return final_line
 
 def process_file(file_path: str) -> dict:
@@ -143,8 +143,7 @@ def write_summary(summary):
         f.write(f"Input Folder: {os.path.abspath(INPUT_FOLDER)}\n")
         f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n")
         f.write(f"Max Workers: {summary['max_workers']}\n")
-        f.write(f"Allowed Exts: {ALLOWED_EXTS}\n")
-        f.write(f"Field name appended: {FIELD_NAME}\n\n")
+        f.write(f"Allowed Exts: {ALLOWED_EXTS}\n\n")
 
         f.write("=== Files ===\n")
         f.write(f"Processed: {summary['files_scanned']}\n")
