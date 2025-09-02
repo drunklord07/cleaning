@@ -11,13 +11,17 @@ from datetime import datetime, timedelta
 from tqdm import tqdm
 
 # ================= CONFIG =================
-INPUT_FOLDER              = "input_txt"                  # non-recursive .txt inputs
-OUTPUT_MATCHES_FOLDER     = "extracted_matches"          # aggregated keyword lines (chunked)
-OUTPUT_MATCHES_BASENAME   = "matches"                    # matches_00001.txt, matches_00002.txt, ...
-STAGING_FOLDER            = "_staging_matches"           # per-file staging before chunking
-SUMMARY_FILE              = "summary_report.txt"
-RESUME_LOG                = "resume_files.log"
+INPUT_FOLDER              = "input_txt"          # non-recursive .txt inputs (read-only)
+OUTPUT_ROOT               = "output_run"         # all outputs live inside this root
+
+WORKING_COPY_FOLDER       = os.path.join(OUTPUT_ROOT, "working_copy")       # processed copy of inputs
+OUTPUT_MATCHES_FOLDER     = os.path.join(OUTPUT_ROOT, "extracted_matches")  # aggregated keyword lines (chunked)
+STAGING_FOLDER            = os.path.join(OUTPUT_ROOT, "_staging_matches")   # per-file staging before chunking
+SUMMARY_FILE              = os.path.join(OUTPUT_ROOT, "summary_report.txt")
+RESUME_LOG                = os.path.join(OUTPUT_ROOT, "resume_files.log")
+
 MAX_WORKERS               = 6
+ALLOWED_EXTS              = (".txt",)
 
 # Matching behavior
 KEYWORDS = [
@@ -28,8 +32,10 @@ CASE_INSENSITIVE  = True         # applies to literals and regex
 
 # Limits
 MAX_LINES_PER_MATCH_FILE = 10_000  # chunk size for extracted output files
-MAX_LINES_PER_INPUT_FILE = 10_000  # enforce this on INPUT_FOLDER after extraction
-ALLOWED_EXTS = (".txt",)
+MAX_LINES_PER_WORK_FILE  = 10_000  # enforce this on WORKING_COPY_FOLDER after extraction
+
+# Clean output root at start (safe because we never touch INPUT_FOLDER)
+CLEAN_OUTPUT_ROOT_AT_START = True
 # =========================================
 
 # ---------- Keyword prep ----------
@@ -63,12 +69,34 @@ def atomic_rewrite(src_path: str, kept_lines_iter):
         os.fsync(fout.fileno())
     os.replace(tmp_path, src_path)  # atomic on same FS
 
-# ---------- Worker ----------
+def sync_input_to_working_copy():
+    """Create a fresh working copy of INPUT_FOLDER (non-recursive, .txt only)."""
+    if CLEAN_OUTPUT_ROOT_AT_START and os.path.isdir(OUTPUT_ROOT):
+        shutil.rmtree(OUTPUT_ROOT, ignore_errors=True)
+
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    os.makedirs(WORKING_COPY_FOLDER, exist_ok=True)
+    os.makedirs(OUTPUT_MATCHES_FOLDER, exist_ok=True)
+    os.makedirs(STAGING_FOLDER, exist_ok=True)
+
+    copied = 0
+    for name in sorted(os.listdir(INPUT_FOLDER)):
+        src = os.path.join(INPUT_FOLDER, name)
+        if not os.path.isfile(src):
+            continue
+        if os.path.splitext(name)[1].lower() not in ALLOWED_EXTS:
+            continue
+        dst = os.path.join(WORKING_COPY_FOLDER, name)
+        shutil.copy2(src, dst)
+        copied += 1
+    return copied
+
+# ---------- Worker (operates ONLY on working copy) ----------
 def process_file(file_path: str) -> dict:
     """
-    For a single .txt:
+    For a single .txt in WORKING_COPY_FOLDER:
       - Extract lines with keywords -> write to a staging file.
-      - Keep non-matching lines -> rewrite original via atomic replace.
+      - Keep non-matching lines -> rewrite working copy via atomic replace.
     """
     local = {
         "file_name": os.path.basename(file_path),
@@ -109,7 +137,7 @@ def process_file(file_path: str) -> dict:
             if not any_line:
                 local["input_was_blank"] = True
 
-        # Rewrite original with kept lines (even if zero)
+        # Rewrite working copy with kept lines (even if zero)
         atomic_rewrite(file_path, kept)
 
         # If nothing was extracted, remove empty staging and unset path
@@ -152,10 +180,9 @@ def chunk_staging_files(staging_paths, out_folder, base_prefix, max_lines_per_fi
     total_written = 0
     total_files = 0
     out_handle = None
-    out_path = None
 
     def open_new():
-        nonlocal out_index, out_line_count, out_handle, out_path, total_files
+        nonlocal out_index, out_line_count, out_handle, total_files
         if out_handle:
             out_handle.flush()
             out_handle.close()
@@ -187,36 +214,31 @@ def chunk_staging_files(staging_paths, out_folder, base_prefix, max_lines_per_fi
             out_handle.flush()
             out_handle.close()
 
-    # If last chunk ended exactly at boundary, a new empty file won't be created; that's okay.
     return total_files, total_written
 
-# ---------- Enforce input max-line policy ----------
-def enforce_max_lines_in_input(max_lines=MAX_LINES_PER_INPUT_FILE):
-    """
-    Re-scan INPUT_FOLDER; if any .txt has > max_lines, split into parts of size <= max_lines.
-    """
+# ---------- Enforce max-line policy on WORKING_COPY_FOLDER ----------
+def enforce_max_lines_in_working_copy(max_lines=MAX_LINES_PER_WORK_FILE):
     files_split = 0
     parts_created = 0
 
-    for name in sorted(os.listdir(INPUT_FOLDER)):
+    for name in sorted(os.listdir(WORKING_COPY_FOLDER)):
         if not name.lower().endswith(".txt"):
             continue
-        path = os.path.join(INPUT_FOLDER, name)
+        path = os.path.join(WORKING_COPY_FOLDER, name)
         if not os.path.isfile(path):
             continue
 
-        # Count lines quickly
+        # Count lines
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 count = sum(1 for _ in f)
         except Exception:
-            # if unreadable, skip; could log/raise as you prefer
             continue
 
         if count <= max_lines:
             continue
 
-        # Split
+        # Split into parts
         files_split += 1
         base, ext = os.path.splitext(name)
         part_idx = 1
@@ -227,10 +249,9 @@ def enforce_max_lines_in_input(max_lines=MAX_LINES_PER_INPUT_FILE):
                 for line in fin:
                     if out is None or lines_in_part >= max_lines:
                         if out:
-                            out.flush()
-                            out.close()
+                            out.flush(); out.close()
                         out_name = f"{base}.part{part_idx:03d}{ext}"
-                        out_path = os.path.join(INPUT_FOLDER, out_name)
+                        out_path = os.path.join(WORKING_COPY_FOLDER, out_name)
                         out = open(out_path, "w", encoding="utf-8")
                         lines_in_part = 0
                         part_idx += 1
@@ -239,8 +260,7 @@ def enforce_max_lines_in_input(max_lines=MAX_LINES_PER_INPUT_FILE):
                     lines_in_part += 1
         finally:
             if out:
-                out.flush()
-                out.close()
+                out.flush(); out.close()
         # Remove original after successful split
         try:
             os.remove(path)
@@ -261,41 +281,46 @@ def load_completed_set(log_path: str) -> set:
     return done
 
 def append_completed(log_path: str, file_name: str):
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(file_name + "\n")
 
 # ---------- Summary ----------
 def write_summary(summary):
+    os.makedirs(os.path.dirname(SUMMARY_FILE) or ".", exist_ok=True)
     summary["end_ts"] = time.time()
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-        f.write(f"Keyword Extract & Split (.txt) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Input Folder:           {os.path.abspath(INPUT_FOLDER)}\n")
-        f.write(f"Matches Output Folder:  {os.path.abspath(OUTPUT_MATCHES_FOLDER)}\n")
-        f.write(f"Staging Folder:         {os.path.abspath(STAGING_FOLDER)}\n")
-        f.write(f"Max Workers:            {summary['max_workers']}\n")
-        f.write(f"Keywords mode:          {'REGEX' if USE_REGEX else 'LITERAL'} | Case-insensitive: {CASE_INSENSITIVE}\n")
-        f.write(f"Keywords:\n")
+        f.write(f"Keyword Extract & Split (.txt, working copy) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Input Folder (read-only): {os.path.abspath(INPUT_FOLDER)}\n")
+        f.write(f"Output Root:              {os.path.abspath(OUTPUT_ROOT)}\n")
+        f.write(f"Working Copy:             {os.path.abspath(WORKING_COPY_FOLDER)}\n")
+        f.write(f"Matches Output:           {os.path.abspath(OUTPUT_MATCHES_FOLDER)}\n")
+        f.write(f"Staging Folder:           {os.path.abspath(STAGING_FOLDER)}\n")
+        f.write(f"Max Workers:              {summary['max_workers']}\n")
+        f.write(f"Keywords mode:            {'REGEX' if USE_REGEX else 'LITERAL'} | Case-insensitive: {CASE_INSENSITIVE}\n")
+        f.write("Keywords:\n")
         for k in KEYWORDS:
             f.write(f"  - {k}\n")
         f.write("\n")
 
         f.write("=== Files ===\n")
-        f.write(f"Processed:        {summary['files_scanned']}\n")
-        f.write(f"Success:          {summary['files_success']}\n")
-        f.write(f"Errors:           {summary['files_error']}\n")
-        f.write(f"Blank inputs:     {len(summary['blank_input_files'])}\n\n")
+        f.write(f"Copied from input:  {summary['files_copied']}\n")
+        f.write(f"Processed:          {summary['files_scanned']}\n")
+        f.write(f"Success:            {summary['files_success']}\n")
+        f.write(f"Errors:             {summary['files_error']}\n")
+        f.write(f"Blank inputs:       {len(summary['blank_input_files'])}\n\n")
 
         f.write("=== Lines (aggregate) ===\n")
-        f.write(f"Total scanned:    {summary['total_lines_scanned']}\n")
-        f.write(f"Total extracted:  {summary['total_lines_extracted']}\n")
-        f.write(f"Total kept:       {summary['total_lines_kept']}\n\n")
+        f.write(f"Total scanned:      {summary['total_lines_scanned']}\n")
+        f.write(f"Total extracted:    {summary['total_lines_extracted']}\n")
+        f.write(f"Total kept:         {summary['total_lines_kept']}\n\n")
 
         f.write("=== Matches Output ===\n")
         f.write(f"Chunk files created: {summary['match_files_created']}\n")
         f.write(f"Lines written out:   {summary['match_lines_written']}\n\n")
 
-        f.write("=== Input Folder Post-Check ===\n")
-        f.write(f"Files split (> {MAX_LINES_PER_INPUT_FILE}): {summary['files_split']}\n")
+        f.write("=== Working Copy Post-Check ===\n")
+        f.write(f"Files split (> {MAX_LINES_PER_WORK_FILE}): {summary['files_split']}\n")
         f.write(f"Parts created:       {summary['parts_created']}\n")
 
         if summary["errors"]:
@@ -305,33 +330,17 @@ def write_summary(summary):
 
 # ---------- Main ----------
 def main():
-    # Prep dirs
     if not os.path.isdir(INPUT_FOLDER):
         print(f"ERROR: INPUT_FOLDER does not exist: {INPUT_FOLDER}", file=sys.stderr)
         sys.exit(1)
-    os.makedirs(OUTPUT_MATCHES_FOLDER, exist_ok=True)
 
-    # Clean staging folder to avoid leftovers from previous runs
-    if os.path.isdir(STAGING_FOLDER):
-        try:
-            shutil.rmtree(STAGING_FOLDER)
-        except Exception:
-            pass
-    os.makedirs(STAGING_FOLDER, exist_ok=True)
-
-    # Discover .txt files
-    all_files = sorted(
-        os.path.join(INPUT_FOLDER, fn)
-        for fn in os.listdir(INPUT_FOLDER)
-        if os.path.isfile(os.path.join(INPUT_FOLDER, fn))
-        and os.path.splitext(fn)[1].lower() in ALLOWED_EXTS
-    )
-    if not all_files:
+    # Build fresh OUTPUT_ROOT & working copy
+    files_copied = sync_input_to_working_copy()
+    if files_copied == 0:
         print(f"No {ALLOWED_EXTS} files found in INPUT_FOLDER.", file=sys.stderr)
-        # Write minimal summary
         summary = {
             "start_ts": time.time(), "end_ts": None, "max_workers": MAX_WORKERS,
-            "files_scanned": 0, "files_success": 0, "files_error": 0,
+            "files_copied": 0, "files_scanned": 0, "files_success": 0, "files_error": 0,
             "blank_input_files": [], "errors": [],
             "total_lines_scanned": 0, "total_lines_extracted": 0, "total_lines_kept": 0,
             "match_files_created": 0, "match_lines_written": 0,
@@ -340,15 +349,22 @@ def main():
         write_summary(summary)
         return
 
+    # Discover .txt files in WORKING_COPY_FOLDER
+    all_files = sorted(
+        os.path.join(WORKING_COPY_FOLDER, fn)
+        for fn in os.listdir(WORKING_COPY_FOLDER)
+        if os.path.isfile(os.path.join(WORKING_COPY_FOLDER, fn))
+        and os.path.splitext(fn)[1].lower() in ALLOWED_EXTS
+    )
+
     completed = load_completed_set(RESUME_LOG)
     pending = [fp for fp in all_files if os.path.basename(fp) not in completed]
     if not pending:
         print("All files already processed per resume log. Nothing to do.")
-        # Still enforce max-line policy post-check
-        files_split, parts_created = enforce_max_lines_in_input()
+        files_split, parts_created = enforce_max_lines_in_working_copy()
         summary = {
             "start_ts": time.time(), "end_ts": None, "max_workers": MAX_WORKERS,
-            "files_scanned": 0, "files_success": 0, "files_error": 0,
+            "files_copied": files_copied, "files_scanned": 0, "files_success": 0, "files_error": 0,
             "blank_input_files": [], "errors": [],
             "total_lines_scanned": 0, "total_lines_extracted": 0, "total_lines_kept": 0,
             "match_files_created": 0, "match_lines_written": 0,
@@ -359,6 +375,7 @@ def main():
 
     summary = {
         "start_ts": time.time(), "end_ts": None, "max_workers": MAX_WORKERS,
+        "files_copied": files_copied,
         "files_scanned": 0, "files_success": 0, "files_error": 0,
         "blank_input_files": [], "errors": [],
         "total_lines_scanned": 0, "total_lines_extracted": 0, "total_lines_kept": 0,
@@ -366,9 +383,9 @@ def main():
         "files_split": 0, "parts_created": 0,
     }
 
-    staging_collected = []  # list of staging paths with extracted lines
+    staging_collected = []  # staging paths with extracted lines
 
-    overall = tqdm(total=len(pending), desc="Extract+Rewrite", unit="file", leave=True)
+    overall = tqdm(total=len(pending), desc="Extract+Rewrite (working copy)", unit="file", leave=True)
     try:
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(process_file, fp): fp for fp in pending}
@@ -410,14 +427,14 @@ def main():
     n_out_files, n_out_lines = chunk_staging_files(
         staging_collected,
         OUTPUT_MATCHES_FOLDER,
-        OUTPUT_MATCHES_BASENAME,
+        "matches",
         MAX_LINES_PER_MATCH_FILE,
     )
     summary["match_files_created"] = n_out_files
     summary["match_lines_written"] = n_out_lines
 
-    # Post-pass: enforce max-line policy on INPUT_FOLDER
-    files_split, parts_created = enforce_max_lines_in_input(MAX_LINES_PER_INPUT_FILE)
+    # Post-pass: enforce max-line policy on WORKING_COPY_FOLDER
+    files_split, parts_created = enforce_max_lines_in_working_copy(MAX_LINES_PER_WORK_FILE)
     summary["files_split"] = files_split
     summary["parts_created"] = parts_created
 
