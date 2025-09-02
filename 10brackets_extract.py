@@ -120,13 +120,31 @@ def write_summary(summary):
         f.write(f"Updated line count in output files: {summary['updated_line_count']}\n")
         f.write(f"Total lines written in {FINAL_FILE}: {summary['final_file_lines']}\n\n")
 
-        # Grand Total Check
-        grand_total = summary['updated_line_count'] + summary['final_file_lines']
-        f.write("=== Grand Total Check ===\n")
-        f.write(f"Original input lines: {summary['total_lines_processed']}\n")
-        f.write(f"Rewritten output lines: {summary['updated_line_count']}\n")
-        f.write(f"Brackets_final lines: {summary['final_file_lines']}\n")
-        f.write(f"Grand total check (should equal input or input + splits): {grand_total}\n\n")
+        # ---- Consistency checks ----
+        expected_output_lines = summary['total_lines_processed'] - summary['nonempty_no_mobile']
+        check_a_ok = (summary['total_lines_processed'] ==
+                      summary['updated_line_count'] + summary['nonempty_no_mobile'])
+
+        expected_final_file_lines = summary['nonempty_no_mobile'] + summary['nonempty_with_mobile']
+        check_b_ok = (summary['final_file_lines'] == expected_final_file_lines)
+
+        lhs = summary['updated_line_count'] + summary['final_file_lines']
+        rhs = summary['total_lines_processed'] + summary['nonempty_with_mobile']
+        check_c_ok = (lhs == rhs)
+
+        f.write("=== Consistency Checks ===\n")
+        f.write(f"A) Original == Rewritten + Moved-only        : "
+                f"{summary['total_lines_processed']} == {summary['updated_line_count']} + {summary['nonempty_no_mobile']}  "
+                f"=> {'PASS' if check_a_ok else 'FAIL'}\n")
+        f.write(f"   Expected Rewritten (computed)             : {expected_output_lines}\n")
+
+        f.write(f"B) Final file lines == Moved + Split         : "
+                f"{summary['final_file_lines']} == {summary['nonempty_no_mobile']} + {summary['nonempty_with_mobile']}  "
+                f"=> {'PASS' if check_b_ok else 'FAIL'}\n")
+        f.write(f"   Expected Final File Lines (computed)      : {expected_final_file_lines}\n")
+
+        f.write(f"C) Rewritten + Final == Original + Splits    : "
+                f"{lhs} == {rhs}  => {'PASS' if check_c_ok else 'FAIL'}\n\n")
 
         if summary["errors"]:
             f.write("=== Errors ===\n")
