@@ -34,22 +34,27 @@ def extract_tokens_and_body(line: str):
     tokens = re.findall(r'\[[^\]]*\]', preamble)
     return tokens, body
 
-def transform_case1(line: str):
+def process_case(line: str, expected_brackets: int, key_name: str, case_id: str):
     """
-    Case 1: 10 brackets preamble with CustomerNo
+    Generic case handler.
+    expected_brackets: exact number of preamble brackets
+    key_name: "CustomerNo" or "Mobile-No"
+    case_id: "case1", "case2", "case3", "case4"
     """
     tokens, rest = extract_tokens_and_body(line)
-    if len(tokens) != 10:
-        return line, "skipped"
+    if len(tokens) != expected_brackets:
+        return line, "unchanged", case_id
 
-    cust_tokens = [t for t in tokens if t.startswith("[CustomerNo")]
-    if not cust_tokens:
-        return line, "skipped"
+    key_tokens = [t for t in tokens if t.startswith(f"[{key_name}")]
+    if not key_tokens:
+        return line, "unchanged", case_id
 
-    cust_val = cust_tokens[0][1:-1].split(":", 1)[1] if ":" in cust_tokens[0] else ""
-    cust_val = cust_val.strip()
+    # Extract key value
+    key_val = ""
+    if ":" in key_tokens[0]:
+        key_val = key_tokens[0][1:-1].split(":", 1)[1].strip()
 
-    # split body and path
+    # Split body and path
     if ";" in rest:
         body, path = rest.split(";", 1)
         body, path = body.strip(), path.strip()
@@ -58,71 +63,43 @@ def transform_case1(line: str):
 
     has_mobile = bool(MOBILE_REGEX.search(body))
 
-    if cust_val:  # non-empty
+    if key_val:  # non-empty
         if has_mobile:
-            new_line = f"[CustomerNo:{cust_val}]{' ' if EMIT_SINGLE_SPACE and body else ''}{body};{path}"
-            return new_line, "nonempty_with_mobile"
+            new_line = f"[{key_name}:{key_val}]{' ' if EMIT_SINGLE_SPACE and body else ''}{body};{path}"
+            return new_line, "nonempty_with_mobile", case_id
         else:
-            new_line = f"[CustomerNo:{cust_val}];{path}"
-            return new_line, "nonempty_no_mobile"
-    else:  # empty customer
-        if has_mobile:
-            new_line = f"{body};{path}"
-            return new_line, "empty_with_mobile"
-        else:
-            return None, "empty_no_mobile"  # dropped
-
-def transform_case2(line: str):
-    """
-    Case 2: 6 brackets preamble with Mobile-No
-    """
-    tokens, rest = extract_tokens_and_body(line)
-    if len(tokens) != 6:
-        return line, "skipped"
-
-    mob_tokens = [t for t in tokens if t.startswith("[Mobile-No")]
-    if not mob_tokens:
-        return line, "skipped"
-
-    mob_val = mob_tokens[0][1:-1].split(":", 1)[1] if ":" in mob_tokens[0] else ""
-    mob_val = mob_val.strip()
-
-    # split body and path
-    if ";" in rest:
-        body, path = rest.split(";", 1)
-        body, path = body.strip(), path.strip()
-    else:
-        body, path = rest.strip(), ""
-
-    has_mobile = bool(MOBILE_REGEX.search(body))
-
-    if mob_val:  # non-empty
-        if has_mobile:
-            new_line = f"[Mobile-No:{mob_val}]{' ' if EMIT_SINGLE_SPACE and body else ''}{body};{path}"
-            return new_line, "nonempty_with_mobile"
-        else:
-            new_line = f"[Mobile-No:{mob_val}];{path}"
-            return new_line, "nonempty_no_mobile"
-    else:  # empty Mobile-No
+            new_line = f"[{key_name}:{key_val}];{path}"
+            return new_line, "nonempty_no_mobile", case_id
+    else:  # empty key
         if has_mobile:
             new_line = f"{body};{path}"
-            return new_line, "empty_with_mobile"
+            return new_line, "empty_with_mobile", case_id
         else:
-            return None, "empty_no_mobile"  # dropped
+            return None, "empty_no_mobile", case_id  # dropped
 
 def process_line(line: str):
     """Dispatcher for line processing across cases."""
-    # Case 1 check
-    out, status = transform_case1(line)
-    if status != "skipped":
-        return out, "case1_" + status
+    # Case 1: 10 brackets + CustomerNo
+    out, status, cid = process_case(line, 10, "CustomerNo", "case1")
+    if status != "unchanged":
+        return out, f"{cid}_{status}"
 
-    # Case 2 check
-    out, status = transform_case2(line)
-    if status != "skipped":
-        return out, "case2_" + status
+    # Case 2: 6 brackets + Mobile-No
+    out, status, cid = process_case(line, 6, "Mobile-No", "case2")
+    if status != "unchanged":
+        return out, f"{cid}_{status}"
 
-    # Unchanged
+    # Case 3: 9 brackets + Mobile-No
+    out, status, cid = process_case(line, 9, "Mobile-No", "case3")
+    if status != "unchanged":
+        return out, f"{cid}_{status}"
+
+    # Case 4: 8 brackets + Mobile-No
+    out, status, cid = process_case(line, 8, "Mobile-No", "case4")
+    if status != "unchanged":
+        return out, f"{cid}_{status}"
+
+    # Unchanged line
     return line, "unchanged"
 
 def process_file(file_path: str):
@@ -131,11 +108,16 @@ def process_file(file_path: str):
         "lines_processed": 0,
         "lines_modified": 0,
         "lines_removed": 0,
-        "case1_counts": {k: 0 for k in ["nonempty_with_mobile","nonempty_no_mobile","empty_with_mobile","empty_no_mobile","skipped"]},
-        "case2_counts": {k: 0 for k in ["nonempty_with_mobile","nonempty_no_mobile","empty_with_mobile","empty_no_mobile","skipped"]},
         "unchanged": 0,
+        "case_counts": {
+            "case1": {k: 0 for k in ["nonempty_with_mobile","nonempty_no_mobile","empty_with_mobile","empty_no_mobile"]},
+            "case2": {k: 0 for k in ["nonempty_with_mobile","nonempty_no_mobile","empty_with_mobile","empty_no_mobile"]},
+            "case3": {k: 0 for k in ["nonempty_with_mobile","nonempty_no_mobile","empty_with_mobile","empty_no_mobile"]},
+            "case4": {k: 0 for k in ["nonempty_with_mobile","nonempty_no_mobile","empty_with_mobile","empty_no_mobile"]},
+        },
         "dropped_lines": [],
         "error": None,
+        "output_lines": 0,
     }
     out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))
 
@@ -145,14 +127,11 @@ def process_file(file_path: str):
             for raw in f_in:
                 local["lines_processed"] += 1
                 new_line, status = process_line(raw.strip("\n"))
-                if status.startswith("case1_"):
-                    key = status.split("_",1)[1]
-                    local["case1_counts"][key] += 1
-                elif status.startswith("case2_"):
-                    key = status.split("_",1)[1]
-                    local["case2_counts"][key] += 1
-                elif status == "unchanged":
-                    local["unchanged"] += 1
+
+                if status.startswith("case"):
+                    cid, key = status.split("_", 1)
+                    if key in local["case_counts"][cid]:
+                        local["case_counts"][cid][key] += 1
 
                 if new_line is None:
                     local["lines_removed"] += 1
@@ -160,7 +139,11 @@ def process_file(file_path: str):
                 else:
                     if new_line != raw.strip():
                         local["lines_modified"] += 1
+                    local["output_lines"] += 1
                     f_out.write(new_line + "\n")
+
+                if status == "unchanged":
+                    local["unchanged"] += 1
 
     except Exception as e:
         try:
@@ -192,15 +175,17 @@ def write_summary(summary):
         f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n")
         f.write(f"Max Workers: {summary['max_workers']}\n\n")
 
-        f.write("=== Case 1: CustomerNo (10 brackets) ===\n")
-        for k,v in summary["case1_counts"].items():
-            f.write(f"{k}: {v}\n")
-        f.write("\n")
-
-        f.write("=== Case 2: Mobile-No (6 brackets) ===\n")
-        for k,v in summary["case2_counts"].items():
-            f.write(f"{k}: {v}\n")
-        f.write("\n")
+        for cid in ["case1","case2","case3","case4"]:
+            label = {
+                "case1": "Case 1: CustomerNo (10 brackets)",
+                "case2": "Case 2: Mobile-No (6 brackets)",
+                "case3": "Case 3: Mobile-No (9 brackets)",
+                "case4": "Case 4: Mobile-No (8 brackets)",
+            }[cid]
+            f.write(f"=== {label} ===\n")
+            for k,v in summary["case_counts"][cid].items():
+                f.write(f"{k}: {v}\n")
+            f.write("\n")
 
         f.write("=== Totals ===\n")
         f.write(f"Files processed : {summary['files_scanned']}\n")
@@ -209,7 +194,8 @@ def write_summary(summary):
         f.write(f"Total lines     : {summary['total_lines_processed']}\n")
         f.write(f"Lines modified  : {summary['total_lines_modified']}\n")
         f.write(f"Lines removed   : {summary['total_lines_removed']}\n")
-        f.write(f"Lines unchanged : {summary['unchanged']}\n\n")
+        f.write(f"Lines unchanged : {summary['unchanged']}\n")
+        f.write(f"Final output lines: {summary['final_output_lines']}\n\n")
 
         if summary["dropped_lines"]:
             f.write("=== Dropped Lines ===\n")
@@ -251,8 +237,13 @@ def main():
         "total_lines_modified": 0,
         "total_lines_removed": 0,
         "unchanged": 0,
-        "case1_counts": {k:0 for k in ["nonempty_with_mobile","nonempty_no_mobile","empty_with_mobile","empty_no_mobile","skipped"]},
-        "case2_counts": {k:0 for k in ["nonempty_with_mobile","nonempty_no_mobile","empty_with_mobile","empty_no_mobile","skipped"]},
+        "final_output_lines": 0,
+        "case_counts": {
+            "case1": {k:0 for k in ["nonempty_with_mobile","nonempty_no_mobile","empty_with_mobile","empty_no_mobile"]},
+            "case2": {k:0 for k in ["nonempty_with_mobile","nonempty_no_mobile","empty_with_mobile","empty_no_mobile"]},
+            "case3": {k:0 for k in ["nonempty_with_mobile","nonempty_no_mobile","empty_with_mobile","empty_no_mobile"]},
+            "case4": {k:0 for k in ["nonempty_with_mobile","nonempty_no_mobile","empty_with_mobile","empty_no_mobile"]},
+        },
         "dropped_lines": [],
         "errors": []
     }
@@ -271,10 +262,10 @@ def main():
                     summary["total_lines_modified"] += res["lines_modified"]
                     summary["total_lines_removed"] += res["lines_removed"]
                     summary["unchanged"] += res["unchanged"]
-                    for k,v in res["case1_counts"].items():
-                        summary["case1_counts"][k] += v
-                    for k,v in res["case2_counts"].items():
-                        summary["case2_counts"][k] += v
+                    summary["final_output_lines"] += res["output_lines"]
+                    for cid in ["case1","case2","case3","case4"]:
+                        for k,v in res["case_counts"][cid].items():
+                            summary["case_counts"][cid][k] += v
                     summary["dropped_lines"].extend(res["dropped_lines"])
                     if res["error"]:
                         summary["files_error"] += 1
