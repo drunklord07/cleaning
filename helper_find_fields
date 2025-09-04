@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+import os
+import re
+import sys
+import traceback
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
+from datetime import datetime
+
+# ========= CONFIGURATION ========= #
+INPUT_FOLDER = r"/path/to/input/folder"   # 🔧 Set your input folder path
+OUTPUT_FILE  = r"/path/to/output/mobile_field_candidates.txt"  # 🔧 Output file path
+MAX_WORKERS  = 6
+ALLOWED_EXTS = (".txt",)
+# ================================= #
+
+# Strict Mobile Regex (10 digits starting [6-9], optional 91 prefix, no embedding in alphanum)
+MOBILE_REGEX = re.compile(r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])')
+
+# Candidate field patterns (allow quotes/brackets/spaces around field/values)
+JSON_FIELD = re.compile(r'["\']?\s*([A-Za-z0-9_\-\.]+)\s*["\']?\s*:\s*["\']?((?:91)?[6-9]\d{9})["\']?')
+XML_FIELD  = re.compile(r'<\s*([A-Za-z0-9_\-\.]+)[^>]*>(?:91)?[6-9]\d{9}\s*<\/\1>')
+KV_FIELD   = re.compile(r'([A-Za-z0-9_\-\.]+)\s*[:=\-]\s*["\']?(?:91)?[6-9]\d{9}["\']?')
+
+# Cleanup wrapper chars (quotes, brackets, etc.)
+WRAPPER_CLEAN = re.compile(r'^[\[\{\("]+\s*|\s*[\]\}\)";,]+$')
+
+def clean_token(tok: str) -> str:
+    """Remove quotes, brackets, trailing punctuation from token."""
+    return WRAPPER_CLEAN.sub("", tok.strip())
+
+def extract_field(line: str, mobile: str) -> str:
+    """Try to extract candidate field name around the matched mobile."""
+
+    # JSON style
+    for m in JSON_FIELD.finditer(line):
+        if m.group(2) == mobile:
+            return clean_token(m.group(1))
+
+    # XML style
+    for m in XML_FIELD.finditer(line):
+        if mobile in m.group(0):
+            return clean_token(m.group(1))
+
+    # key=value / key:val / key-number style
+    for m in KV_FIELD.finditer(line):
+        if mobile in m.group(0):
+            return clean_token(m.group(1))
+
+    # Heuristic: split into tokens and look before mobile
+    tokens = re.split(r'[\s:;=,_\-\.\|\[\]\{\}\(\)\'"]+', line)
+    for i, tok in enumerate(tokens):
+        if tok == mobile:
+            if i > 0:
+                candidate = clean_token(tokens[i-1])
+                if re.match(r'^[A-Za-z][A-Za-z0-9_\-\.]+$', candidate):
+                    return candidate
+    return None
+
+
+def process_file(path: Path) -> list:
+    """Process a single file and return candidate matches."""
+    results = []
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                for m in MOBILE_REGEX.finditer(line):
+                    mobile = m.group(0)
+                    field = extract_field(line, mobile)
+                    if field:  # Only keep if a field was found
+                        results.append(f"{line} ; {path} ; {mobile} ; {field}")
+    except Exception:
+        traceback.print_exc()
+    return results
+
+
+def main():
+    input_path = Path(INPUT_FOLDER)
+    all_txt_files = [p for p in input_path.rglob("*") if p.suffix in ALLOWED_EXTS]
+
+    if not all_txt_files:
+        print("No .txt files found in input folder.")
+        return
+
+    all_results = []
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_file, f): f for f in all_txt_files}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
+            try:
+                all_results.extend(fut.result())
+            except Exception as e:
+                print(f"Error processing file {futures[fut]}: {e}")
+
+    # Write output
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
+        for r in all_results:
+            out.write(r + "\n")
+
+    # Summary
+    print("\n========== SUMMARY ==========")
+    print(f"Input Folder       : {INPUT_FOLDER}")
+    print(f"Output File        : {OUTPUT_FILE}")
+    print(f"Files Scanned      : {len(all_txt_files)}")
+    print(f"Total Lines Output : {len(all_results)}")
+    print(f"Completed at       : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("================================")
+
+
+if __name__ == "__main__":
+    main()
