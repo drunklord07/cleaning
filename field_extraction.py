@@ -12,7 +12,7 @@ import time
 import threading
 
 # ========= CONFIGURATION ========= #
-INPUT_FOLDER  = "input_logs"         # 🔧 just folder name, script finds it in current dir
+INPUT_FOLDER  = "input_logs"         # 🔧 folder name, script finds it in current dir
 OUTPUT_FOLDER = "output_mobile"      # 🔧 created in current dir
 FIELDS_FOLDER = Path(OUTPUT_FOLDER) / "fields_identified"
 MIRROR_FOLDER = Path(OUTPUT_FOLDER) / "mirror"
@@ -22,6 +22,7 @@ RESUME_FILE   = Path(OUTPUT_FOLDER) / "resume.log"
 MAX_WORKERS   = 6
 CHUNK_SIZE    = 10000
 SUMMARY_REFRESH_INTERVAL = 30        # seconds
+DISCOVERY_TIMEOUT = 120              # seconds per file in Pass 1
 # ================================= #
 
 # ✅ MOBILE REGEX
@@ -242,9 +243,14 @@ def main():
     print("PASS 1: Discovering valid fields...")
     discovered = set()
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(discover_worker, f) for f in files_to_process]
+        futures = {executor.submit(discover_worker, f): f for f in files_to_process}
         for fut in tqdm(as_completed(futures), total=len(futures)):
-            discovered.update(fut.result())
+            file_path = futures[fut]
+            try:
+                result = fut.result(timeout=DISCOVERY_TIMEOUT)
+                discovered.update(result)
+            except Exception as e:
+                print(f"⚠️ Discovery failed or timed out for {file_path}: {e}")
     valid_fields = VALID_FIELDS.union(discovered)
     with open(FIELDS_RUN, "w", encoding="utf-8") as f:
         for fld in sorted(valid_fields):
