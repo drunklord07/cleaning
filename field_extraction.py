@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import traceback
+import multiprocessing
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
@@ -242,7 +243,7 @@ def main():
     # ---------- PASS 1 ---------- #
     print("PASS 1: Discovering valid fields...")
     discovered = set()
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=multiprocessing.get_context("spawn")) as executor:
         futures = {executor.submit(discover_worker, f): f for f in files_to_process}
         for fut in tqdm(as_completed(futures), total=len(futures)):
             file_path = futures[fut]
@@ -251,6 +252,7 @@ def main():
                 discovered.update(result)
             except Exception as e:
                 print(f"⚠️ Discovery failed or timed out for {file_path}: {e}")
+                fut.cancel()
     valid_fields = VALID_FIELDS.union(discovered)
     with open(FIELDS_RUN, "w", encoding="utf-8") as f:
         for fld in sorted(valid_fields):
@@ -274,7 +276,7 @@ def main():
                 out.write(line + "\n")
         return idx + 1
 
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=multiprocessing.get_context("spawn")) as executor:
         futures = [executor.submit(extract_lines, f, valid_fields) for f in files_to_process]
         for fut in tqdm(as_completed(futures), total=len(futures)):
             (local_stats, local_field_counts, local_examples,
