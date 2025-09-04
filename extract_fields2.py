@@ -4,20 +4,22 @@ import sys
 import traceback
 import threading
 import time
+import random
+import multiprocessing as mp
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
 from datetime import datetime
 from tqdm import tqdm
-import random
 
 # ============= CONFIG ============= #
-INPUT_FOLDER   = "input_logs"          # put your input folder name here (in current dir)
-OUTPUT_FOLDER  = "output_mobile"       # outputs will be created under this
-MAX_WORKERS    = 6
-CHUNK_SIZE     = 10_000                # files of 10k rows each
-MIRROR_TRUNCATE = 1500                 # max chars of log_line kept in mirror output
-SUMMARY_REFRESH_INTERVAL = 30          # seconds (live summary rewrite)
+INPUT_FOLDER    = "input_logs"          # put your input folder name here (in current dir)
+OUTPUT_FOLDER   = "output_mobile"       # outputs will be created under this
+MAX_WORKERS     = 6
+CHUNK_SIZE      = 10_000                # files of 10k rows each
+MIRROR_TRUNCATE = 1500                  # max chars of log_line kept in mirror output
+SUMMARY_REFRESH_INTERVAL = 30           # seconds (live summary rewrite)
+QUEUE_MAXSIZE   = 10000                 # backpressure to keep memory bounded
 # ================================== #
 
 OUT_FIELDS_DIR  = Path(OUTPUT_FOLDER) / "fields_identified"
@@ -54,8 +56,7 @@ def make_patterns(mobile_escaped: str):
         rf'<\s*(?P<field>[A-Za-z0-9_.\-]+)[^>]*>[^<]*?(?P<mobile>{mobile_escaped})[^<]*?</\s*\1\s*>',
         re.IGNORECASE | re.DOTALL,
     )
-
-    # Priority: JSON quoted → key/value → XML attribute → XML tag content
+    # Priority order
     return (p_json_quoted, p_kv, p_xml_attr, p_xml_tag)
 
 
@@ -71,14 +72,14 @@ def identify_field_for_mobile(log_line: str, mobile: str):
     return None
 
 
-def process_file(path: Path, extracted_writer, mirror_writer):
+def process_file(path: Path, extracted_q, mirror_q):
     """
     Worker processes one file and returns:
       stats                - dict counters
       per_field_counts     - dict field -> count
       per_field_example    - dict field -> example row (first seen)
       path_only_samples    - list[str] some samples of path-only lines
-    Writes rows via stream-writers (no buffering in RAM).
+    It does NOT write to disk; it enqueues rows to extracted_q/mirror_q.
     Tracks 'partial-valid lines' when a single line has both extracted and mirrored matches.
     """
     stats = defaultdict(int)
@@ -133,14 +134,14 @@ def process_file(path: Path, extracted_writer, mirror_writer):
                     if field:
                         # extracted row (full log_line retained)
                         row = f"{log_line} ; {file_path} ; {field} ; mobile_regex ; {mobile_val}\n"
-                        extracted_writer.write(row)
+                        extracted_q.put(row)
                         stats["extracted_matches"] += 1
                         per_field_counts[field] += 1
                         if field not in per_field_example:
                             per_field_example[field] = row.strip()
                         line_had_extracted = True
                     else:
-                        # mirror row (truncate log_line to keep memory & files small)
+                        # mirror row (truncate log_line to keep files manageable)
                         reason = "NO_FIELD_PATTERN"
                         short_log = (
                             log_line[:MIRROR_TRUNCATE] + "...TRUNCATED..."
@@ -148,7 +149,7 @@ def process_file(path: Path, extracted_writer, mirror_writer):
                             else log_line
                         )
                         row = f"{short_log} ; {file_path} ; UNIDENTIFIED_FIELD ; mobile_regex ; {mobile_val} ; reason={reason}\n"
-                        mirror_writer.write(row)
+                        mirror_q.put(row)
                         stats["mirrored_matches"] += 1
                         line_had_mirrored = True
 
@@ -166,33 +167,43 @@ def process_file(path: Path, extracted_writer, mirror_writer):
     return stats, per_field_counts, per_field_example, path_only_samples
 
 
-def open_chunk_writer(base_dir: Path, prefix: str, chunk_size: int):
+def writer_loop(queue: mp.Queue, base_dir: Path, prefix: str, chunk_size: int, stop_event: threading.Event):
     """
-    Returns (writer_fn, close_fn).
-    writer_fn(line: str) writes immediately and rolls to a new file every chunk_size lines.
+    Runs in a thread in the MAIN process.
+    Consumes lines from a multiprocessing Queue and writes them to rolling chunk files.
+    Terminates on sentinel None or when stop_event is set AND queue is empty.
     """
     base_dir.mkdir(parents=True, exist_ok=True)
     counter, lines = 1, 0
     fh = (base_dir / f"{prefix}_{counter:03d}.txt").open("w", encoding="utf-8")
 
-    lock = threading.Lock()  # protect writer in case of interleaved calls
+    try:
+        while True:
+            try:
+                item = queue.get(timeout=0.5)
+            except Exception:
+                # timeout: check if we should stop (no more producers)
+                if stop_event.is_set() and queue.empty():
+                    break
+                continue
 
-    def writer(line: str):
-        nonlocal fh, lines, counter
-        with lock:
-            fh.write(line)
+            if item is None:
+                # explicit sentinel; writer can stop after draining
+                if stop_event.is_set() and queue.empty():
+                    break
+                else:
+                    # ignore sentinel until queue drains and stop_event set
+                    continue
+
+            fh.write(item)
             lines += 1
             if lines >= chunk_size:
                 fh.close()
                 counter += 1
                 lines = 0
                 fh = (base_dir / f"{prefix}_{counter:03d}.txt").open("w", encoding="utf-8")
-
-    def close():
-        with lock:
-            fh.close()
-
-    return writer, close
+    finally:
+        fh.close()
 
 
 def write_summary(input_dir: Path,
@@ -269,7 +280,6 @@ def summary_refresher_loop(input_dir: Path,
         try:
             write_summary(input_dir, G_stats, G_field_counts, G_field_example, G_path_only_samples, stage="Live")
         except Exception as e:
-            # don't crash refresher
             with open(ERRORS_FILE, "a", encoding="utf-8") as ef:
                 ef.write(f"[{datetime.now().isoformat(timespec='seconds')}] summary_refresher: {e}\n")
                 ef.write(traceback.format_exc() + "\n")
@@ -291,22 +301,39 @@ def main():
     files = [p for p in input_dir.rglob("*.txt")]
     if not files:
         print("No .txt files found in input.")
-        # still write an empty summary for completeness
         write_summary(input_dir, defaultdict(int), {}, {}, [], stage="Final")
         sys.exit(0)
 
-    # Shuffle to distribute big files across the run (smoother progress)
     random.shuffle(files)
+
+    # Queues for streaming writes from workers -> main
+    ctx = mp.get_context("spawn")  # safer across platforms
+    extracted_q = ctx.Queue(maxsize=QUEUE_MAXSIZE)
+    mirror_q    = ctx.Queue(maxsize=QUEUE_MAXSIZE)
+
+    # Writer stop events
+    extracted_stop = threading.Event()
+    mirror_stop    = threading.Event()
+
+    # Writer threads
+    t_extr = threading.Thread(
+        target=writer_loop,
+        args=(extracted_q, OUT_FIELDS_DIR, "extracted", CHUNK_SIZE, extracted_stop),
+        daemon=True,
+    )
+    t_mirr = threading.Thread(
+        target=writer_loop,
+        args=(mirror_q, OUT_MIRROR_DIR, "mirror", CHUNK_SIZE, mirror_stop),
+        daemon=True,
+    )
+    t_extr.start()
+    t_mirr.start()
 
     # Global aggregations
     G_stats = defaultdict(int)
     G_field_counts = defaultdict(int)
     G_field_example = {}
     G_path_only_samples = []
-
-    # Stream-writers for chunked files
-    extracted_writer, close_extr = open_chunk_writer(OUT_FIELDS_DIR, "extracted", CHUNK_SIZE)
-    mirror_writer, close_mirr   = open_chunk_writer(OUT_MIRROR_DIR, "mirror", CHUNK_SIZE)
 
     # Live summary refresher
     stop_event = threading.Event()
@@ -317,35 +344,36 @@ def main():
     )
     refresher.start()
 
-    # Process in parallel
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(process_file, p, extracted_writer, mirror_writer) for p in files]
+    # Process in parallel; pass queues into workers
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=ctx) as ex:
+        futures = [ex.submit(process_file, p, extracted_q, mirror_q) for p in files]
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
             stats, field_counts, field_example, path_only = fut.result()
 
             # Merge stats
             for k, v in stats.items():
                 G_stats[k] += v
-
             for k, v in field_counts.items():
                 G_field_counts[k] += v
-
             for k, v in field_example.items():
                 if k not in G_field_example:
                     G_field_example[k] = v
-
             # keep up to 50 samples globally
             for ln in path_only:
                 if len(G_path_only_samples) < 50:
                     G_path_only_samples.append(ln)
 
-    # Close writers and refresher
-    close_extr()
-    close_mirr()
+    # Signal writers to stop after queues drain
+    extracted_stop.set()
+    mirror_stop.set()
+    extracted_q.put(None)
+    mirror_q.put(None)
+    t_extr.join()
+    t_mirr.join()
+
+    # Stop refresher and write final summary
     stop_event.set()
     refresher.join(timeout=2)
-
-    # Final summary
     write_summary(input_dir, G_stats, G_field_counts, G_field_example, G_path_only_samples, stage="Final")
 
     # Console recap
