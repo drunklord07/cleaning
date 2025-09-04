@@ -70,6 +70,12 @@ def discover_fields(file_path: Path, discovered: set) -> int:
         traceback.print_exc()
     return new_count
 
+def discover_worker(file_path: Path):
+    """Worker wrapper for discovery (returns a set)."""
+    local_discovered = set()
+    discover_fields(file_path, local_discovered)
+    return local_discovered
+
 # ============================================= #
 #            PASS 2: EXTRACTION                 #
 # ============================================= #
@@ -236,7 +242,9 @@ def main():
     print("PASS 1: Discovering valid fields...")
     discovered = set()
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        list(tqdm(executor.map(lambda f: discover_fields(f, discovered), files_to_process), total=len(files_to_process)))
+        futures = [executor.submit(discover_worker, f) for f in files_to_process]
+        for fut in tqdm(as_completed(futures), total=len(futures)):
+            discovered.update(fut.result())
     valid_fields = VALID_FIELDS.union(discovered)
     with open(FIELDS_RUN, "w", encoding="utf-8") as f:
         for fld in sorted(valid_fields):
