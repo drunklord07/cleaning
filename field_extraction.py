@@ -23,7 +23,7 @@ RESUME_FILE   = Path(OUTPUT_FOLDER) / "resume.log"
 MAX_WORKERS   = 6
 CHUNK_SIZE    = 10000
 SUMMARY_REFRESH_INTERVAL = 30        # seconds
-DISCOVERY_TIMEOUT = 120              # seconds per file in Pass 1
+SKIP_LAST_DISCOVERY = 6              # ⚠️ Skip last N files in Pass 1 (set 0 for none)
 # ================================= #
 
 # ✅ MOBILE REGEX
@@ -242,17 +242,24 @@ def main():
 
     # ---------- PASS 1 ---------- #
     print("PASS 1: Discovering valid fields...")
+
+    if SKIP_LAST_DISCOVERY > 0 and SKIP_LAST_DISCOVERY < len(files_to_process):
+        files_for_discovery = files_to_process[:-SKIP_LAST_DISCOVERY]
+        print(f"⚠️ Skipping last {SKIP_LAST_DISCOVERY} files in discovery stage.")
+    else:
+        files_for_discovery = files_to_process
+
     discovered = set()
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=multiprocessing.get_context("spawn")) as executor:
-        futures = {executor.submit(discover_worker, f): f for f in files_to_process}
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(discover_worker, f): f for f in files_for_discovery}
         for fut in tqdm(as_completed(futures), total=len(futures)):
             file_path = futures[fut]
             try:
-                result = fut.result(timeout=DISCOVERY_TIMEOUT)
+                result = fut.result()   # no timeout, always waits
                 discovered.update(result)
             except Exception as e:
-                print(f"⚠️ Discovery failed or timed out for {file_path}: {e}")
-                fut.cancel()
+                print(f"⚠️ Discovery failed for {file_path}: {e}")
+
     valid_fields = VALID_FIELDS.union(discovered)
     with open(FIELDS_RUN, "w", encoding="utf-8") as f:
         for fld in sorted(valid_fields):
@@ -276,7 +283,7 @@ def main():
                 out.write(line + "\n")
         return idx + 1
 
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=multiprocessing.get_context("spawn")) as executor:
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(extract_lines, f, valid_fields) for f in files_to_process]
         for fut in tqdm(as_completed(futures), total=len(futures)):
             (local_stats, local_field_counts, local_examples,
