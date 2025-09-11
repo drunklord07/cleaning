@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from tqdm import tqdm
+
+# ========= CONFIGURATION ========= #
+INPUT_FOLDER = "input_logs"              # Folder with .txt inputs
+OUTPUT_FOLDER = "ip_filtered_output"     # Folder for cleaned outputs
+SUMMARY_FILE = "summary_report.txt"      # Saved in current working dir
+CHUNK_SIZE = 10000                       # Max lines per output file
+MAX_WORKERS = 6                          # Parallel workers
+ALLOWED_EXTS = (".txt",)                 # Process only .txt files
+# ================================= #
+
+summary = {
+    "files_scanned": 0,
+    "total_lines": 0,
+    "lines_written": 0,
+    "lines_dropped": 0,
+    "dropped_10": 0,
+    "dropped_127": 0,
+    "dropped_0": 0,
+    "errors": []
+}
+
+def ensure_folders():
+    Path(OUTPUT_FOLDER).mkdir(parents=True, exist_ok=True)
+
+def parse_line(line: str):
+    """
+    Parse a line from the right:
+    log line ; path ; field ; regex type ; regex match
+    Returns: (full_line, ip)
+    """
+    parts = [p.strip() for p in line.strip().split(";")]
+    if len(parts) < 5:
+        return None, None
+    ip = parts[-1]
+    return line.strip(), ip
+
+def process_file(file_path: Path) -> dict:
+    local_stats = {
+        "lines_in": 0,
+        "lines_out": 0,
+        "dropped_10": 0,
+        "dropped_127": 0,
+        "dropped_0": 0,
+        "errors": None,
+        "kept_lines": []
+    }
+
+    try:
+        with file_path.open("r", encoding="utf-8", errors="ignore") as fin:
+            for line in fin:
+                if not line.strip():
+                    continue
+                local_stats["lines_in"] += 1
+                full_line, ip = parse_line(line)
+                if not ip:
+                    continue
+
+                if ip.startswith("10."):
+                    local_stats["dropped_10"] += 1
+                elif ip.startswith("127."):
+                    local_stats["dropped_127"] += 1
+                elif ip.startswith("0.0.0."):
+                    local_stats["dropped_0"] += 1
+                else:
+                    local_stats["kept_lines"].append(full_line)
+                    local_stats["lines_out"] += 1
+
+    except Exception as e:
+        local_stats["errors"] = f"{file_path}: {e}"
+
+    return {str(file_path): local_stats}
+
+def write_output(kept_lines):
+    lines_written = 0
+    file_index = 1
+    current_count = 0
+
+    def new_output_file(idx):
+        return Path(OUTPUT_FOLDER) / f"output_{idx:04d}.txt"
+
+    output_path = new_output_file(file_index)
+    fout = output_path.open("w", encoding="utf-8")
+
+    for line in kept_lines:
+        fout.write(line + "\n")
+        lines_written += 1
+        current_count += 1
+
+        if current_count >= CHUNK_SIZE:
+            fout.close()
+            file_index += 1
+            output_path = new_output_file(file_index)
+            fout = output_path.open("w", encoding="utf-8")
+            current_count = 0
+
+    fout.close()
+    return lines_written, file_index
+
+def write_summary():
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+        f.write("Summary Report\n")
+        f.write("====================\n")
+        f.write(f"Input Folder: {INPUT_FOLDER}\n")
+        f.write(f"Output Folder: {OUTPUT_FOLDER}\n\n")
+        f.write(f"Total Files Scanned: {summary['files_scanned']}\n")
+        f.write(f"Total Lines Read: {summary['total_lines']}\n")
+        f.write(f"Total Lines Written: {summary['lines_written']}\n")
+        f.write(f"Total Lines Dropped: {summary['lines_dropped']}\n")
+        f.write(f"  - Dropped (10.*): {summary['dropped_10']}\n")
+        f.write(f"  - Dropped (127.*): {summary['dropped_127']}\n")
+        f.write(f"  - Dropped (0.0.0.*): {summary['dropped_0']}\n\n")
+
+        if summary["errors"]:
+            f.write("Errors:\n")
+            for err in summary["errors"]:
+                f.write(f"- {err}\n")
+        else:
+            f.write("No errors encountered.\n")
+
+def main():
+    ensure_folders()
+    input_dir = Path(INPUT_FOLDER)
+    files = [f for f in input_dir.glob("*") if f.suffix in ALLOWED_EXTS]
+
+    if not files:
+        print("No .txt files found in input folder.")
+        return
+
+    all_kept_lines = []
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_file, f): f for f in files}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
+            result = future.result()
+            for fname, stats in result.items():
+                summary["files_scanned"] += 1
+                summary["total_lines"] += stats["lines_in"]
+                summary["lines_written"] += stats["lines_out"]
+                summary["dropped_10"] += stats["dropped_10"]
+                summary["dropped_127"] += stats["dropped_127"]
+                summary["dropped_0"] += stats["dropped_0"]
+                summary["lines_dropped"] += (
+                    stats["dropped_10"] + stats["dropped_127"] + stats["dropped_0"]
+                )
+                if stats["errors"]:
+                    summary["errors"].append(stats["errors"])
+                all_kept_lines.extend(stats["kept_lines"])
+
+    lines_written, num_files = write_output(all_kept_lines)
+    summary["lines_written"] = lines_written
+
+    write_summary()
+    print(f"Processing complete. {num_files} output files written. See summary_report.txt for details.")
+
+if __name__ == "__main__":
+    main()
