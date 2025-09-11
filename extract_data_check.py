@@ -27,7 +27,7 @@ def ensure_folders():
 def process_file(file_path: Path) -> dict:
     """
     Process a single .txt file:
-    - Keeps only the 4 middle-right fields (5th, 4th, 3rd, 2nd from the right).
+    - Keeps only the last 4 fields (from the right).
     - Writes cleaned lines to output file.
     """
     local_stats = {"lines_in": 0, "lines_out": 0, "errors": None}
@@ -45,13 +45,13 @@ def process_file(file_path: Path) -> dict:
 
                 parts = [p.strip() for p in line.split(";")]
                 if len(parts) >= 5:
-                    # Keep 4 fields: 5th, 4th, 3rd, 2nd from right
-                    cleaned_parts = parts[-5:-1]
+                    # Keep last 4 fields from the right
+                    cleaned_parts = parts[-4:]
                     cleaned = " ; ".join(cleaned_parts)
                     fout.write(cleaned + "\n")
                     local_stats["lines_out"] += 1
                 else:
-                    # Skip malformed lines
+                    # Skip malformed lines (<5 fields)
                     continue
 
     except Exception as e:
